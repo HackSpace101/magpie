@@ -2,6 +2,7 @@ package gui
 
 import (
 	"cmp"
+	"context"
 	"encoding/json"
 	"net/http"
 	"slices"
@@ -75,6 +76,20 @@ func callerKeyRoutes(mux *http.ServeMux) {
 			return
 		}
 		writeJSON(w, map[string]any{"keys": withLimits(keys), "accountNames": provider.AccountNames(), "accountGroups": accountGroupsJSON()})
+	})
+	// the subscription accounts' windows a key's limit can follow
+	// (ljayic on X): each one's 5 hours, week or month, from the cards as
+	// last read; an account not read yet is read meanwhile, waited for a
+	// few seconds at most
+	mux.HandleFunc("GET /api/caller-keys/account-windows", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
+		defer cancel()
+		out := provider.KeyWindows(ctx, time.Now())
+		if out == nil {
+			out = []provider.KeyWindow{}
+		}
+		writeJSON(w, map[string]any{"windows": out})
 	})
 	// the models a key may be held to (#882), and the accounts and keys
 	// (#905): the routing groups, then each provider's models, then its
@@ -162,11 +177,22 @@ func callerKeyRoutes(mux *http.ServeMux) {
 				out = slices.Insert(out, at, m)
 			}
 		}
+		// a provider that serves no model now (a plugin still starting, a
+		// list not fetched yet) can still be allowed whole, <provider>/*,
+		// for the models it serves later
+		listed := map[string]bool{}
+		for _, m := range out {
+			listed[m.Provider] = true
+		}
+		empty := []keyModelJSON{}
 		for _, p := range provider.All() {
 			if !p.On() {
 				continue
 			}
 			name := cmp.Or(p.Name, p.ID)
+			if !listed[p.ID] {
+				empty = append(empty, keyModelJSON{ID: p.ID + "/*", Name: name, Provider: p.ID, ProviderName: name})
+			}
 			// an account by its stable id, kept through renames, shown by the
 			// name the user gave it, else who is signed in; a key by its
 			// fingerprint
@@ -176,7 +202,7 @@ func callerKeyRoutes(mux *http.ServeMux) {
 		}
 		// the account groups a key's accounts may name, "@<id>" or "!@<id>"
 		// (LeiWang_2000 on X), each with its accounts
-		writeJSON(w, map[string]any{"models": out, "accounts": accounts, "groups": accountGroupsJSON()})
+		writeJSON(w, map[string]any{"models": out, "accounts": accounts, "providers": empty, "groups": accountGroupsJSON()})
 	})
 	// the MCP servers and tools a key may be held to (wakaka on Discord):
 	// magpie's own, then the Library's, each with its tools by name
