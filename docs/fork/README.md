@@ -21,7 +21,11 @@
 - `internal/plugin/stream_limit_fork.go`：启动时把 `streamBudget` 设为“并发数 × 每个流的窗口（512KB）”
 - `internal/plugin/stream_limit_fork_test.go`：保证这个改动一直生效（同步时也会跑）
 
-另外加了两个工作流：`.github/workflows/fork-sync.yml`（同步上游）和 `.github/workflows/fork-build.yml`（手动编译），以及这份文档。
+此外：
+
+- **删掉了上游的整个 `.github`**（上游的工作流、issue 模板、UI 预览工具），只留下这个 fork 自己的两个工作流：`fork-sync.yml`（同步上游）和 `fork-build.yml`（手动编译）；
+- `.fork/`：同步用的脚本 `sync.sh`、fork 自有路径清单 `owned`，以及 `upstream`（记录当前 `main` 基于上游的哪个提交）；
+- 这份文档。
 
 ### 1.1 `MAGPIE_PLUGIN_STREAMS`
 
@@ -56,12 +60,12 @@
 - 账号很多、token 刷新很频繁时，账号文件 `plugin-auth.json` 的读写；
 - 用量记录、网关自身对每个请求的处理开销。
 
-所以**上线前请用接近真实的流量压测一次**（见第 7 节），重点看 Bun 进程的 CPU。
+所以**上线前请用接近真实的流量压测一次**（见 7.6），重点看 Bun 进程的 CPU。
 
 ### 1.3 没有改的
 
 - **网关请求钩子**（带 `onRequest` 一类网关钩子的插件）也有一个 128 的上限，写在 `internal/plugin/host.js` 的 `GATEWAY_RUN_LIMIT` 里。超过时，那个请求会跳过钩子、照常转发，而不是失败。只用供应商插件的话，碰不到这个限制。
-- **网关这一层的限流**（每个账号的并发、排队、RPM 等）还是 magpie 原来的机制，默认都不限制，按需配置（见 6.4）。
+- **网关这一层的限流**（每个账号的并发、排队、RPM 等）还是 magpie 原来的机制，默认都不限制，按需配置（见 7.4）。
 
 ---
 
@@ -81,40 +85,25 @@ GitHub 上从公开仓库 fork 出来的仓库**只能是公开的**，你的改
 
 另外，私有仓库的 Actions 有免费分钟数限制（编译一次大约要几分钟到十几分钟），公开仓库没有。
 
-### 2.2 启用 Actions，并关掉上游的工作流
+### 2.2 启用 Actions
 
-fork 里也带着上游自己的工作流（测试、发布、Docker 镜像、通知同步等）。它们是给上游用的，在你的仓库里要么跑不通，要么白白消耗资源。
+打开仓库的 **Actions** 页面，点击启用。只会看到两个工作流：**Fork sync** 和 **Fork build**。
 
-1. 打开仓库的 **Actions** 页面，点击启用。
-2. 关掉下面这些上游工作流（在 Actions 页面左侧点进每个工作流，右上角 `···` → **Disable workflow**），或者用 `gh` 命令：
+上游的工作流（测试、发布、Docker 镜像、通知同步等）已经从这个 fork 里删掉了，以后同步时也不会带进来（见 3.1），所以不需要逐个停用。
 
-   ```bash
-   R=<你的用户名>/<仓库名>
-   for w in docker.yml docker-daily.yml docker-stable.yml notes-mirror.yml \
-            privacy-filter.yml release.yml ui-preview.yml test.yml; do
-     gh workflow disable "$w" -R "$R"
-   done
-   ```
+### 2.3 不需要任何 token
 
-   `test.yml` 是上游的完整测试，耗时很长。你想在自己仓库里也跑完整测试的话，可以保留它。
+两个工作流都只用 GitHub 自动提供的 `GITHUB_TOKEN`，**不需要你创建或存放任何个人 token**。
 
-3. 保持启用：**Fork sync** 和 **Fork build**。
+原因：`GITHUB_TOKEN` 唯一不能推送的，是修改了 `.github/workflows/` 下文件的提交。而同步做出的提交**从来不碰 `.github`**（见 3.1），所以它可以推送。
 
-### 2.3 创建 `SYNC_TOKEN`（强烈建议）
+`GITHUB_TOKEN` 只在每次运行期间有效，运行结束就失效，也只能访问这一个仓库。
 
-同步工作流要把合并结果推回 `main`。上游有时会修改 `.github/workflows/` 下的文件，而 GitHub 自带的 `GITHUB_TOKEN` **永远没有修改工作流文件的权限**。所以没有这个 token 时，同步平时能用，但上游一改工作流就会失败。
-
-1. GitHub 右上角头像 → **Settings** → **Developer settings** → **Personal access tokens** → **Fine-grained tokens** → **Generate new token**。
-2. **Repository access** 选 **Only select repositories**，只选你的这个仓库。
-3. **Permissions** → **Repository permissions** 里设置：
-   - **Contents**：Read and write
-   - **Workflows**：Read and write
-4. 有效期按需选（过期后要重新生成、更新 secret）。
-5. 复制 token，到仓库 **Settings** → **Secrets and variables** → **Actions** → **New repository secret**，名称填 `SYNC_TOKEN`。
+**以后如果你自己要改这两个工作流**，在本地改好后用你自己的 git 推送就行，同步不会覆盖它们。
 
 ### 2.4 第一次手动同步
 
-Actions → **Fork sync** → **Run workflow**。成功以后，`main` 上会出现一个 `sync: merge yetone/magpie@xxxxxxxxx (N commits)` 的合并提交。如果没有新提交，日志会显示 `nothing to do`。
+Actions → **Fork sync** → **Run workflow**。成功以后，`main` 上会多一个 `sync: yetone/magpie@xxxxxxxxxxxx` 的提交，说明里有上游对应的提交链接，以及这次同步的变更对比链接。如果已经是最新的，日志会显示 `nothing to do`。
 
 ---
 
@@ -124,41 +113,42 @@ Actions → **Fork sync** → **Run workflow**。成功以后，`main` 上会出
 
 **Fork sync** 每 6 小时运行一次（UTC 每天 0、6、12、18 点的第 17 分），也可以随时手动运行：
 
-1. 拉取上游 `main`。**不拉取上游的 tag**：推一个 `v*` tag 进来，会在你的仓库里触发上游的发布流程。
-2. 如果已经包含了上游最新的提交，就直接结束。
-3. 否则把上游合并进你的 `main`（是 merge，不是 rebase，不会改写历史）。
-4. 检查合并结果：
+1. 拉取上游 `main` 的最新提交（只拉一层，不拉上游的 tag）。
+2. 用 `.fork/sync.sh` 做一个新提交，它的内容是：
+   - **上游最新的全部文件**，包括新增、修改和删除；
+   - **去掉上游的 `.github`**：上游的工作流永远不会进入你的仓库，也就不会在你的仓库里运行；
+   - **加上这个 fork 自有的路径**（列在 `.fork/owned` 里），用的是你仓库里的版本，上游同名的文件会被忽略；
+   - 更新 `.fork/upstream`，记下这次基于上游的哪个提交。
+3. 如果内容和现在的 `main` 完全一样，说明已经是最新的，直接结束。
+4. 检查这个新提交：
    - `go vet -tags nogui ./internal/plugin`
    - `go build -tags nogui .`
    - 这个 fork 自己的测试，确认 2048 的上限还在
-5. 全部通过才推送。
+5. 全部通过才推送到 `main`。
 
-只要有任何一步失败（冲突、编译失败、测试失败、推送被拒），**就什么都不推送**，`main` 保持原样，并自动开一个带 `fork-sync` 标签的 issue（已经有打开的就在下面追加评论）。GitHub 也会给你发运行失败的邮件。
+这种做法**不会产生合并冲突**，因为 fork 的改动只在它自己的路径里。代价是：你的 `main` 不再包含上游的逐条提交历史，每次同步只有一个提交。想看上游这段时间改了什么，点提交说明里的 `Changes:` 链接，会在上游仓库里打开两次同步之间的对比。
 
-### 3.2 同步失败怎么办
+只要有任何一步失败（编译失败、测试失败、推送被拒），**就什么都不推送**，`main` 保持原样，并自动开一个带 `fork-sync` 标签的 issue（已经有打开的就在下面追加评论）。GitHub 也会给你发运行失败的邮件。
 
-先看 issue 里写的原因：
+### 3.2 以后要加自己的改动
 
-**情况一：合并冲突。** 因为这个 fork 只加了新文件，冲突的可能性很小。真遇到了，在本地手动解决：
+规则只有一条：**改动放在新文件里，并把路径加进 `.fork/owned`。**
 
-```bash
-git checkout main
-git pull
-git fetch https://github.com/yetone/magpie.git main
-git merge FETCH_HEAD          # 解决冲突后 git add、git commit
-go test -tags nogui -run 'TestFork' ./internal/plugin
-git push
-```
+如果直接改上游已有的文件，下一次同步会用上游的版本把它覆盖掉。确实需要改上游的某个文件时，先想办法改成"新增一个文件"（像这次放开 128 那样，在新文件里用 `init()` 调整），实在做不到再单独处理。
 
-**情况二：fork 的测试失败**（`TestForkHostTakesMoreThanUpstreamsStreams` 等）。说明上游改了插件宿主，比如改了 `streamBudget` 或 `streamWindow` 的名字或用法。去看上游 `internal/plugin/host.go` 里现在怎么定义并发上限，相应地修改 `stream_limit_fork.go`。
+### 3.3 同步失败怎么办
 
-**情况三：推送被拒，提示缺少 `workflows` 权限。** 按 2.3 节配置 `SYNC_TOKEN`，或者检查它是否过期。
+先看 issue 里的运行日志：
 
-**情况四：上游 main 本身编译不过。** 偶尔会发生，等上游修好以后，下一次定时同步会自动通过。
+**情况一：fork 的测试失败**（`TestForkHostTakesMoreThanUpstreamsStreams` 等）。说明上游改了插件宿主，比如改了 `streamBudget` 或 `streamWindow` 的名字或用法。去看上游 `internal/plugin/host.go` 里现在怎么定义并发上限，相应地修改 `stream_limit_fork.go`，用你自己的 git 推送，再运行一次 Fork sync。
+
+**情况二：编译失败。** 通常是上游 main 本身暂时编译不过，等上游修好以后，下一次定时同步会自动通过。也可能是上游删除或改名了这个 fork 的代码所依赖的东西，处理方式同情况一。
+
+**情况三：推送被拒。** 一般是同步期间你正好往 `main` 推了提交，再运行一次就好。如果提示没有修改工作流的权限，说明哪个工作流文件被改了，检查 `.fork/owned` 里是否还有 `.github`。
 
 问题解决以后，手动运行一次 **Fork sync**，确认成功后关掉对应的 issue。
 
-### 3.3 什么时候升级部署
+### 3.4 什么时候升级部署
 
 同步只会更新代码，**不会自动更新你正在运行的网关**。部署的版本完全由你控制：需要的时候运行一次 **Fork build**，再按第 8 节升级。考虑到上游一天可能有上百个提交，建议：
 
@@ -188,9 +178,11 @@ Actions → **Fork build** → **Run workflow**，有四个选项：
 
 ### 4.2 版本号，以及为什么它不会自己更新
 
-版本号的格式是 `v0.1.1900-12-gabc1234-fork`：上游最近的发布 tag、在那之后的提交数、提交哈希，再加上 `-fork`。
+版本号的格式是 `v0.1.1900-12-gabc123456-fork.1a2b3c4`，依次是：上游最近的发布 tag、当前基于的上游提交（`.fork/upstream`）在那之后的提交数、那个上游提交的哈希，最后是 `-fork.` 加上你仓库里这次编译的提交。
 
-这个格式对 magpie 来说表示“从源码编译的版本”。**magpie 只有正式发布版才会自动更新**（`internal/update/update.go` 的 `Released`），所以这个 fork 的编译产物**永远不会把自己更新成上游的官方版本**（否则你的改动就没了），也不会发送使用统计。
+找不到上游 tag 时（比如访问不了上游），会退回成 `v0.0.0-0-g<上游哈希>-fork.<提交>`。
+
+这个格式对 magpie 来说表示“从源码编译的版本”。**magpie 只有正式发布版才会自动更新**（`internal/update/update.go` 的 `Released`），所以这个 fork 的编译产物**永远不会把自己更新成上游的官方版本**（否则你的改动就没了），也不会发送使用统计。上面两种格式我都用 `Released` 实际检查过。
 
 ### 4.3 拉取 GHCR 镜像
 
@@ -206,12 +198,13 @@ GHCR 上新建的镜像默认是私有的。两种做法：
 
 ```bash
 go run ./build/assetpack internal/gui/assets internal/gui/assets.zip
-V="$(git describe --tags --long --always --match 'v[0-9]*')-fork"
+up=$(cat .fork/upstream)
+V="v0.0.0-0-g${up:0:9}-fork.$(git rev-parse --short=7 HEAD)"
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags "nogui packedassets" -trimpath \
   -ldflags "-s -w -X main.version=$V" -o magpie-gateway-linux-amd64 .
 ```
 
-本地仓库里如果没有上游的 tag，版本号就只是一个提交哈希，同样不会自动更新。
+本地编译用的是退回格式的版本号，同样不会自动更新。
 
 ---
 
@@ -532,4 +525,4 @@ magpie provider at-once <供应商id> off
 
 **界面显示的版本号很长、像一个提交哈希。** 正常，见 4.2。
 
-**同步工作流一直失败。** 看第 3.2 节。
+**同步工作流一直失败。** 看第 3.3 节。

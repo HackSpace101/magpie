@@ -1,0 +1,21 @@
+# Paths this fork owns. Fork sync (.fork/sync.sh) makes main's tree from
+# upstream's, drops upstream's copy of each path below, and keeps this
+# repo's. One path per line, a file or a folder, from the repo root.
+#
+# A fork change lives in a path listed here. Changing a file upstream also
+# has would be undone by the next sync: put the change in a new file and
+# list it.
+
+# workflows: only the fork's own run here, and the built-in token may
+# push a sync only while it changes none of them
+.github
+
+# the sync's own files, and the upstream commit main is built from
+.fork
+
+# the fork's deploy guide
+docs/fork
+
+# the plugin host's raised stream limit
+internal/plugin/stream_limit_fork.go
+internal/plugin/stream_limit_fork_test.go

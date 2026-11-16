@@ -7,8 +7,9 @@
 # - optionally a Docker image, ghcr.io/<owner>/magpie-gateway:<version> and
 #   :latest, from the repo's own Dockerfile.
 #
-# The version is git describe --long of upstream's release tags plus
-# "-fork" (v0.1.1900-12-gabc1234-fork). magpie takes a version of that
+# The version is the upstream commit main is built from, as git describe
+# --long of upstream's release tags says it, plus this repo's commit
+# (v0.1.1900-12-gabc1234-fork.1a2b3c4). magpie takes a version of that
 # shape for a build from source, and only a release updates itself, so
 # this build never replaces itself with upstream's release.
 name: Fork build
@@ -46,18 +47,41 @@ jobs:
       version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          filter: blob:none
       - name: Version
         id: v
         run: |
           set -euo pipefail
-          # upstream's release tags, into this runner only
-          git fetch --no-recurse-submodules --force "$UPSTREAM_URL" 'refs/tags/v*:refs/tags/v*' >/dev/null 2>&1 || true
-          v="$(git describe --tags --long --always --match 'v[0-9]*' | tr -cd 'A-Za-z0-9._-')-fork"
+          # the upstream commit main is built from (.fork/sync.sh writes it)
+          up=$(tr -d '[:space:]' < .fork/upstream)
+          here=$(git rev-parse --short=7 HEAD)
+          # how far past upstream's last release that commit is, from 500
+          # commits of its history and the release tags' commits (ls-remote),
+          # into this runner only
+          desc=""
+          if git fetch --quiet --no-tags --depth=500 "$UPSTREAM_URL" "$up" &&
+            git ls-remote --tags "$UPSTREAM_URL" 'v[0-9]*' > "$RUNNER_TEMP/tags"; then
+            # commit → tag, the peeled line of an annotated tag winning
+            declare -A tag=()
+            while read -r sha ref; do
+              name=${ref#refs/tags/}
+              if [[ $name == *'^{}' ]]; then tag[$sha]=${name%'^{}'}
+              elif [ -z "${tag[$sha]:-}" ]; then tag[$sha]=$name; fi
+            done < "$RUNNER_TEMP/tags"
+            n=0
+            for c in $(git rev-list --first-parent "$up"); do
+              if [ -n "${tag[$c]:-}" ]; then desc="${tag[$c]}-$n-g${up:0:9}"; break; fi
+              n=$((n + 1))
+            done
+          fi
+          # describe's shape (N-gSHA after the version) is what magpie
+          # takes for a build from source; the fallback keeps that shape
+          [ -n "$desc" ] || desc="v0.0.0-0-g${up:0:9}"
+          v=$(printf '%s-fork.%s' "$desc" "$here" | tr -cd 'A-Za-z0-9._-')
           echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "### Version: \`$v\`" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Version: \`$v\`"
+            echo "Upstream: https://github.com/yetone/magpie/commit/$up"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   binaries:
     needs: version
