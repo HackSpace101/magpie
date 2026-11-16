@@ -1,0 +1,208 @@
+# Builds this fork's gateway by hand: the terminal build of magpie (no
+# desktop app), which serves the gateway and the web UI (magpie serve --web,
+# magpie web). Run it from Actions › Fork build › Run workflow.
+#
+# It makes:
+# - binaries for the targets asked, as one artifact with SHA256SUMS;
+# - optionally a Docker image, ghcr.io/<owner>/magpie-gateway:<version> and
+#   :latest, from the repo's own Dockerfile.
+#
+# The version is git describe --long of upstream's release tags plus
+# "-fork" (v0.1.1900-12-gabc1234-fork). magpie takes a version of that
+# shape for a build from source, and only a release updates itself, so
+# this build never replaces itself with upstream's release.
+name: Fork build
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: 'Binaries, GOOS/GOARCH separated by spaces (empty: none)'
+        type: string
+        default: 'linux/amd64 linux/arm64'
+      docker:
+        description: 'Also build and push a Docker image to GHCR'
+        type: boolean
+        default: true
+      docker_arm64:
+        description: 'The Docker image for linux/arm64 too (needs the ubuntu-24.04-arm runner)'
+        type: boolean
+        default: false
+      tests:
+        description: 'Run go vet and the plugin host tests first'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_URL: https://github.com/yetone/magpie.git
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+      - name: Version
+        id: v
+        run: |
+          set -euo pipefail
+          # upstream's release tags, into this runner only
+          git fetch --no-recurse-submodules --force "$UPSTREAM_URL" 'refs/tags/v*:refs/tags/v*' >/dev/null 2>&1 || true
+          v="$(git describe --tags --long --always --match 'v[0-9]*' | tr -cd 'A-Za-z0-9._-')-fork"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "### Version: \`$v\`" >> "$GITHUB_STEP_SUMMARY"
+
+  binaries:
+    needs: version
+    if: inputs.targets != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TARGETS: ${{ inputs.targets }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet and test the plugin host
+        if: inputs.tests
+        run: |
+          set -euo pipefail
+          go vet -tags nogui ./internal/plugin
+          go test -tags nogui -count=1 ./internal/plugin
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          # the web UI's files, packed into the binary as a release's are
+          go run ./build/assetpack internal/gui/assets internal/gui/assets.zip
+          mkdir -p dist
+          for t in $TARGETS; do
+            os=${t%/*}; arch=${t#*/}; ext=""
+            [ "$os" = windows ] && ext=.exe
+            out="dist/magpie-gateway-$os-$arch$ext"
+            echo "::group::$os/$arch → $out"
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -tags "nogui packedassets" -trimpath \
+              -ldflags "-s -w -X main.version=$VERSION" -o "$out" .
+            echo "::endgroup::"
+          done
+          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Smoke test the linux/amd64 binary
+        if: contains(inputs.targets, 'linux/amd64')
+        run: |
+          set -euo pipefail
+          b=dist/magpie-gateway-linux-amd64
+          "$b" version || "$b" --version || true
+          h=$(mktemp -d)
+          HOME="$h" XDG_CONFIG_HOME="$h/config" XDG_CACHE_HOME="$h/cache" XDG_DATA_HOME="$h/data" XDG_STATE_HOME="$h/state" \
+            MAGPIE_ADDR=127.0.0.1:13425 MAGPIE_WEB_KEY=ci-smoke-key-0123456789 MAGPIE_UPDATE_FEED=http://127.0.0.1:9/ \
+            "$b" serve --web=127.0.0.1:13430 > "$h/serve.log" 2>&1 &
+          pid=$!
+          ok=0
+          for _ in $(seq 1 60); do
+            if curl -s -o /dev/null http://127.0.0.1:13425/v1/models; then ok=1; break; fi
+            sleep 1
+          done
+          web=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:13430/?k=ci-smoke-key-0123456789" || true)
+          kill "$pid" || true
+          wait "$pid" || true
+          cat "$h/serve.log"
+          test "$ok" = 1
+          echo "web UI answered HTTP $web"
+          case "$web" in 2*|3*) ;; *) echo "::error::the web UI didn't answer"; exit 1 ;; esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: magpie-gateway-${{ env.VERSION }}
+          path: dist/*
+          retention-days: 30
+
+  docker:
+    needs: version
+    if: inputs.docker
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(inputs.docker_arm64 && '["linux/amd64","linux/arm64"]' || '["linux/amd64"]') }}
+    # a native arm runner, not QEMU: the Dockerfile compiles Go in its build stage
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image name
+        run: |
+          # GHCR names are lower case; an owner may not be
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/magpie-gateway" >> "$GITHUB_ENV"
+          echo "ARCH=${PLATFORM#linux/}" >> "$GITHUB_ENV"
+        env:
+          PLATFORM: ${{ matrix.platform }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          push: true
+          build-args: |
+            VERSION=${{ env.VERSION }}
+          tags: ${{ env.IMAGE }}:${{ env.VERSION }}-${{ env.ARCH }}
+          cache-from: type=gha,scope=fork-${{ matrix.platform }}
+          cache-to: type=gha,scope=fork-${{ matrix.platform }},mode=max
+
+  docker-manifest:
+    needs: [version, docker]
+    if: inputs.docker
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      ARM64: ${{ inputs.docker_arm64 }}
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Tag the version and latest
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/magpie-gateway"
+          src=("$IMAGE:$VERSION-amd64")
+          [ "$ARM64" = true ] && src+=("$IMAGE:$VERSION-arm64")
+          docker buildx imagetools create -t "$IMAGE:$VERSION" -t "$IMAGE:latest" "${src[@]}"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+          {
+            echo "### Docker image"
+            echo '```'
+            echo "docker pull $IMAGE:$VERSION"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

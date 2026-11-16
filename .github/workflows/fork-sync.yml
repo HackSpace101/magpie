@@ -1,0 +1,119 @@
+# Keeps this private fork's main up to date with yetone/magpie's main.
+#
+# On a schedule (and by hand) it merges upstream main into this repo's
+# main, checks the merge still builds and the fork's own change still
+# holds (internal/plugin/stream_limit_fork*.go), and pushes. A merge
+# conflict or a failed check pushes nothing and opens (or comments on) an
+# issue labelled fork-sync, so main is never left broken.
+#
+# Token: pushing a merge that brings upstream changes to .github/workflows
+# needs the "workflows" permission, which the built-in GITHUB_TOKEN never
+# has. Store a fine-grained personal access token for this repository with
+# Contents: Read and write, and Workflows: Read and write, as the secret
+# SYNC_TOKEN. Without it the sync uses GITHUB_TOKEN and works until upstream
+# touches a workflow file. See docs/fork/README.md.
+name: Fork sync
+
+on:
+  schedule:
+    # every 6 hours, at minute 17 (UTC)
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/yetone/magpie.git
+  UPSTREAM_BRANCH: main
+  BRANCH: main
+
+jobs:
+  sync:
+    # never in upstream itself
+    if: github.repository != 'yetone/magpie'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # upstream's tags stay out: a v* tag pushed here would start
+          # upstream's release workflow in this repo
+          git fetch --no-tags "$UPSTREAM_URL" "$UPSTREAM_BRANCH"
+          up=$(git rev-parse FETCH_HEAD)
+          echo "upstream=$up" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$up" HEAD; then
+            echo "Already contains upstream ${up:0:9}; nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          behind=$(git rev-list --count "HEAD..$up")
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          if ! git merge --no-edit -m "sync: merge yetone/magpie@${up:0:9} ($behind commits)" "$up"; then
+            git diff --name-only --diff-filter=U | tee conflicts.txt
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "::error::Merging upstream ${up:0:9} conflicts; nothing was pushed."
+            exit 1
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          git log --oneline -1
+
+      - uses: actions/setup-go@v5
+        if: steps.merge.outputs.changed == 'true'
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check the merge
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          go vet -tags nogui ./internal/plugin
+          CGO_ENABLED=0 go build -tags nogui -o /dev/null .
+          # the fork's change: the plugin host's raised stream limit
+          go test -tags nogui -count=1 \
+            -run 'TestForkStreams|TestForkHostTakesMoreThanUpstreamsStreams|TestHostAdmissionLimitFailsTheNewCall|TestHostFetchWaitsForAStreamWindow' \
+            ./internal/plugin
+
+      - name: Push
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin "HEAD:$BRANCH"
+
+      - name: Report a failed sync
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream }}
+          CONFLICT: ${{ steps.merge.outputs.conflict }}
+        run: |
+          set -uo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ "${CONFLICT:-}" = "true" ]; then
+            why="Merging upstream conflicts in:"$'\n\n'"$(sed 's/^/- /' conflicts.txt 2>/dev/null)"
+          else
+            why="The merge, its checks or the push failed (a workflow-file change without SYNC_TOKEN fails the push). See the run's log."
+          fi
+          body="Upstream: yetone/magpie@${UPSTREAM_SHA:-unknown}"$'\n'"Run: $run_url"$'\n\n'"$why"$'\n\n'"Nothing was pushed; main is as it was. Fix by hand (docs/fork/README.md, \"同步失败怎么办\"), then run Fork sync again."
+          gh label create fork-sync --color B60205 --description "Fork sync with upstream failed" --force >/dev/null 2>&1 || true
+          open=$(gh issue list --label fork-sync --state open --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "$body"
+          else
+            gh issue create --title "Fork sync with upstream failed" --label fork-sync --body "$body"
+          fi
