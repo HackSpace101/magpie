@@ -2,10 +2,12 @@
 
 这篇只讲一件事：**用 Docker 把这个 fork 的 magpie 部署成一台对外服务的网关，以及以后怎么一键升级。**
 
+默认的方式是**纯 IP 加 HTTP**，不需要域名，也不需要证书。
+
 所有操作都由一个脚本完成：[`deploy/docker/magpie.sh`](../../deploy/docker/magpie.sh)。装好以后，服务器上会多一个命令 `magpiectl`，之后的升级、回滚、备份、查看状态都用它。
 
 ```
-安装    sudo bash magpie.sh install --domain gw.example.com
+安装    sudo bash magpie.sh install --public <服务器IP>
 升级    sudo magpiectl upgrade
 回滚    sudo magpiectl rollback
 状态    magpiectl status
@@ -25,7 +27,14 @@
 | 磁盘 | 20GB 以上。用量记录会持续增长，流量大时要定期关注 |
 | Docker | 没有的话脚本会帮你安装 |
 
-### 1.2 先编译出镜像
+### 1.2 端口
+
+| 端口 | 作用 | 谁需要访问 |
+| --- | --- | --- |
+| **3425** | 网关，客户端调用的地方 | 你的客户端。**云服务器的安全组或防火墙要放行它** |
+| 3430 | Web 管理界面 | 只有你自己，默认只在服务器本机监听，通过 SSH 隧道打开（见 2.4） |
+
+### 1.3 先编译出镜像
 
 在 GitHub 仓库的 **Actions → Fork build → Run workflow** 里运行一次，勾选 `docker`（arm64 服务器还要勾选 `docker_arm64`）。完成后镜像就是：
 
@@ -36,16 +45,7 @@ ghcr.io/hackspace101/magpie-gateway:latest
 **镜像默认是私有的**，服务器拉取时需要登录。两种做法任选一种：
 
 - **改成公开**：GitHub 个人主页 → **Packages** → `magpie-gateway` → **Package settings** → **Change visibility** → Public。镜像里只有代码，没有你的任何配置和账号。
-- **保持私有**：在 GitHub 生成一个**只有 `read:packages` 权限**的 classic token，安装和升级时通过环境变量传给脚本（见 2.4）。token 会通过标准输入交给 `docker login`，不会写进任何脚本或配置文件。
-
-### 1.3 决定访问方式
-
-| 方式 | 适合 | 需要准备 |
-| --- | --- | --- |
-| **A. 用域名自动配好 HTTPS**（推荐） | 对外提供服务 | 一个域名，A 记录（或 AAAA 记录）指向这台服务器；云服务器的安全组或防火墙放行 **80 和 443** |
-| B. 不配域名，只在服务器本机监听 | 你已经有自己的 nginx 或负载均衡；或者只想先试一下 | 没有 |
-
-选 A 时，脚本会额外启动一个 [Caddy](https://caddyserver.com/) 容器，它会自动向 Let's Encrypt 申请证书并续期，不需要你手动管证书。
+- **保持私有**：在 GitHub 生成一个**只有 `read:packages` 权限**的 classic token，安装和升级时通过环境变量传给脚本（见 2.3）。token 会通过标准输入交给 `docker login`，不会写进任何脚本或配置文件。
 
 ---
 
@@ -61,69 +61,91 @@ curl -fsSLO https://raw.githubusercontent.com/HackSpace101/magpie/main/deploy/do
 
 服务器访问不了 GitHub 的话，在自己电脑上下载这个文件，再用 `scp` 传上去。
 
-### 2.2 方式 A：带域名和 HTTPS（推荐）
+### 2.2 安装
 
 ```bash
-sudo bash magpie.sh install --domain gw.example.com
+sudo bash magpie.sh install --public 203.0.113.7
 ```
 
-### 2.3 方式 B：不配域名
+把 `203.0.113.7` 换成**客户端用来访问这台服务器的 IP**：
+
+- 客户端在公网上：填公网 IP；
+- 客户端和服务器在同一个内网或 VPC 里：填内网 IP，流量不出内网，更安全也更快。
+
+装好以后：
+
+- 网关监听在服务器的所有网卡上：`http://203.0.113.7:3425`；
+- Web 管理界面**只在服务器本机**：`http://127.0.0.1:3430`。
+
+**建议同时限制来源 IP**，只让你的客户端能访问，其他地址就算拿到了网关密钥也用不了：
 
 ```bash
-sudo bash magpie.sh install
+sudo bash magpie.sh install --public 203.0.113.7 --allow-ips 198.51.100.7,10.0.0.0/8
 ```
 
-magpie 只监听在服务器的 `127.0.0.1` 上，外面访问不到。你可以：
-
-- 用 SSH 隧道打开 Web 界面：在**自己电脑上**执行 `ssh -L 3430:127.0.0.1:3430 用户@服务器`，然后在浏览器打开安装完成时打印的 `http://127.0.0.1:3430/?k=...` 地址；
-- 或者在服务器上用你自己的 nginx 转发到 `127.0.0.1:3430`（见 9.3 节）。
-
-### 2.4 镜像是私有的
+### 2.3 镜像是私有的
 
 在命令前面加上这两个环境变量：
 
 ```bash
-sudo GHCR_USER=你的GitHub用户名 GHCR_TOKEN=你的token bash magpie.sh install --domain gw.example.com
+sudo GHCR_USER=你的GitHub用户名 GHCR_TOKEN=你的token bash magpie.sh install --public 203.0.113.7
 ```
 
 不想让 token 出现在 shell 历史里，可以先 `read -s GHCR_TOKEN` 输入，再 `export GHCR_TOKEN`，最后用 `sudo -E` 运行。
+
+### 2.4 打开 Web 管理界面
+
+安装结束时会打印一个 `http://127.0.0.1:3430/?k=...` 的地址。管理界面只在服务器本机监听，在**你自己的电脑上**建一个 SSH 隧道：
+
+```bash
+ssh -L 3430:127.0.0.1:3430 用户@203.0.113.7
+```
+
+保持这个窗口开着，在浏览器里打开打印出来的那个地址即可。key 会换成 cookie，并从地址栏里去掉，浏览器保持登录 400 天。以后只要隧道开着，打开 `http://127.0.0.1:3430` 就行。
+
+为什么不直接对外开放管理界面：**带 `?k=` 的链接就是管理员密码**，用 HTTP 在公网上打开，等于把它明文发了出去。如果服务器只在你的内网里，确实想直接访问，可以用 `--web-bind 0.0.0.0`（脚本会给出警告）。
+
+忘了链接可以执行 `magpiectl url`。
 
 ### 2.5 安装时脚本做了什么
 
 1. **检查 Docker**：没装的话询问是否安装（用官方的 `get.docker.com`）。国内服务器可以加 `DOCKER_MIRROR=Aliyun`，使用阿里云的镜像源。
 2. **创建目录** `/opt/magpie`，权限设为只有 root 能读。
-3. **生成 `.env`**：里面有 Web 界面的登录 key（随机生成，以后重新运行安装时也不会变）和各项设置，权限 600。
-4. **生成 `compose.yaml`** 和 `caddy/Caddyfile`。
+3. **生成 `.env`**：里面有 Web 界面的登录 key（随机生成，以后重新运行安装也不会变）和各项设置，权限 600。
+4. **生成 `compose.yaml`**。
 5. **调整系统参数**：文件句柄、连接队列、端口范围等，详见第 6 节。
 6. **安装 `magpiectl` 命令**：把脚本复制到 `/opt/magpie/magpie.sh`，再链接成 `/usr/local/bin/magpiectl`。
-7. **拉取镜像并固定版本**：把 `latest` 换成镜像的摘要（`@sha256:...`）记进 `.env`。这样以后即使 `latest` 指向了新版本，**重启也不会悄悄换版本**，只有执行 `magpiectl upgrade` 才会升级。
-8. **启动并等待健康检查通过**（最多 3 分钟），最后打印 Web 界面地址和网关地址。
+7. **拉取镜像并固定版本**：把 `latest` 换成镜像的摘要（`@sha256:...`）记进 `.env`。以后即使 `latest` 指向了新版本，**重启也不会悄悄换版本**，只有执行 `magpiectl upgrade` 才会升级。
+8. **启动并等待健康检查通过**（最多 3 分钟），最后打印 Web 界面和网关的地址。
 
 ### 2.6 安装完成后
 
-安装结束时会打印类似这样的信息：
+在 Web 管理界面里：
 
-```
-Web UI
-  https://gw.example.com/?k=8dfb6557...
-Gateway (each client needs a gateway key)
-  OpenAI: https://gw.example.com/v1    Anthropic / Gemini: https://gw.example.com
-```
+1. **安装你的供应商插件**：在 **插件** 页面安装，来源可以是 npm、GitHub，或者服务器上的一个文件夹。
+2. **登录账号**：在 **供应商** 页面操作。网页登录完成后，浏览器会跳到一个打不开的 `localhost` 地址，**把地址栏里的完整地址复制下来**，粘贴到登录框的"回调 URL"里。
 
-接着在 Web 界面里：
+然后在服务器上：
 
-1. **打开带 `?k=` 的链接**：key 会换成 cookie，并从地址栏里去掉，浏览器保持登录 400 天。**这个链接等于管理员密码，不要发给别人。** 忘了可以执行 `magpiectl url` 再看一次。
-2. **安装你的供应商插件**：在 **插件** 页面安装，来源可以是 npm、GitHub，或者服务器上的一个文件夹。
-3. **登录账号**：在 **供应商** 页面操作。网页登录完成后，浏览器会跳到一个打不开的 `localhost` 地址，**把地址栏里的完整地址复制下来**，粘贴到登录框的"回调 URL"里。
-4. **给每个调用方生成网关密钥**：
+3. **给每个调用方生成网关密钥**：
    ```bash
    sudo magpiectl key add 客户端A
    ```
    它会打印一个 `sk-magpie-key-...`。每个密钥可以在 **网关 → 网关密钥** 里单独设置用量上限、可用模型和并发上限。
-5. **测试一下**：
+4. **在客户端上测试**：
    ```bash
-   curl https://gw.example.com/v1/models -H "Authorization: Bearer sk-magpie-key-..."
+   curl http://203.0.113.7:3425/v1/models -H "Authorization: Bearer sk-magpie-key-..."
    ```
+
+客户端配置：
+
+| 客户端类型 | 地址 | API key |
+| --- | --- | --- |
+| OpenAI 兼容 | `http://203.0.113.7:3425/v1` | 网关密钥 |
+| Anthropic（如 Claude Code） | `http://203.0.113.7:3425` | 网关密钥 |
+| Gemini | `http://203.0.113.7:3425` | 网关密钥 |
+
+模型名写 `供应商/模型`，或者路由组的名字。`GET /v1/models` 会列出所有可用的模型。
 
 ---
 
@@ -195,12 +217,12 @@ sudo magpiectl install         # 如果新脚本改了 compose.yaml，重新生�
 | 命令 | 作用 |
 | --- | --- |
 | `magpiectl status` | 容器状态、运行的版本、当前镜像和上一个镜像、插件并发上限、容器的文件句柄上限、数据大小、备份数量 |
-| `magpiectl logs` | 实时查看 magpie 的日志（`magpiectl logs caddy` 查看 Caddy 的） |
+| `magpiectl logs` | 实时查看 magpie 的日志 |
 | `magpiectl url` | 再显示一次 Web 界面和网关的地址 |
 | `sudo magpiectl key add <名字>` | 生成一个网关密钥 |
 | `sudo magpiectl backup` | 手动备份一次 |
 | `sudo magpiectl restart` | 重启 magpie |
-| `sudo magpiectl install [选项]` | 修改设置后重新应用，比如 `--streams 4096`、`--domain 新域名`。原有设置和 key 都会保留 |
+| `sudo magpiectl install [选项]` | 修改设置后重新应用，比如 `--streams 4096`、`--allow-ips ...`。没有指定的设置和 key 都会保留 |
 | `magpiectl help` | 全部命令和选项 |
 
 在容器里执行 magpie 自己的命令：
@@ -304,7 +326,7 @@ sudo docker exec magpie sh -c 'ulimit -n; cat /proc/sys/net/core/somaxconn'
 ├── compose.yaml         由脚本生成，不要手动改（重新安装时会被覆盖，旧版本留在 .bak）
 ├── config/              magpie 的全部数据：供应商、账号、插件、网关密钥、用量记录
 │   └── cache/           Bun、模型目录等缓存，可以删除（会重新下载）
-├── caddy/               Caddyfile，以及证书（data/）
+├── caddy/               只有用域名时才用到（附录 A）
 └── backups/             备份，最多保留 10 份
 ```
 
@@ -320,22 +342,29 @@ sudo docker exec magpie sh -c 'ulimit -n; cat /proc/sys/net/core/somaxconn'
 | `MAGPIE_IMAGE_REF` | 当前运行的镜像摘要 | 由脚本维护 |
 | `MAGPIE_PREV_IMAGE_REF` | 上一个镜像摘要 | 用于回滚，由脚本维护 |
 | `MAGPIE_PLUGIN_STREAMS` | 2048 | 插件并发上限 |
-| `MAGPIE_DOMAIN` | 空 | 设置了就启动 Caddy、提供 HTTPS |
-| `MAGPIE_PUBLIC_URL` / `MAGPIE_WEB_URL` | 根据域名自动设置 | magpie 显示给使用者看的地址 |
-| `MAGPIE_BIND` | 127.0.0.1 | magpie 自己的两个端口发布在宿主机的哪个地址上 |
+| `MAGPIE_BIND` | 127.0.0.1 | 网关端口发布在宿主机的哪个地址上。`--public` 会设成 0.0.0.0 |
+| `MAGPIE_WEB_BIND` | 127.0.0.1 | Web 界面端口发布在宿主机的哪个地址上 |
 | `MAGPIE_GATEWAY_PORT` / `MAGPIE_WEB_PORT` | 3425 / 3430 | 宿主机上的端口号 |
-| `MAGPIE_ALLOW_IPS` | 空 | 只允许这些地址访问（不能和域名一起用，见 9.4） |
+| `MAGPIE_PUBLIC_URL` | `--public` 时自动设置 | magpie 显示给使用者看的网关地址 |
+| `MAGPIE_ALLOW_IPS` | 空（不限制） | 只允许这些地址访问；`--allow-ips off` 取消限制 |
 | `TZ` | Asia/Shanghai | 时区 |
+| `MAGPIE_DOMAIN`、`MAGPIE_WEB_URL`、`COMPOSE_PROFILES` | 空 | 只有用域名时才用到（附录 A） |
 
 ---
 
 ## 8. 安全
 
-- **Web 界面的链接（带 `?k=`）就是管理员权限**：拿到它就能修改所有设置、看到所有密钥。只给自己用。
-- **网关的每个请求都需要网关密钥**：容器里的 magpie 监听在 `0.0.0.0` 上，所以从容器外来的所有请求（包括经过 Caddy 的）都必须带一个启用的密钥，否则返回 401。
-- **不配域名时，magpie 只对服务器本机开放**。如果用 `--bind 0.0.0.0` 直接对外开放端口，流量是明文的，脚本会给出警告。
+纯 IP 加 HTTP 意味着**流量是明文的**：网关密钥和请求内容（提示词、代码）在链路上都能被看到。下面几条能大幅降低风险：
+
+- **限制来源 IP**（`--allow-ips`）：其他地址的请求在检查密钥之前就会被拒绝（403），泄露的密钥从别处也用不了。不经过代理时，magpie 看到的就是客户端的真实 IP，这个限制是可靠的。
+- **能走内网就走内网**：客户端和服务器在同一个 VPC 时，`--public` 填内网 IP，安全组只对内网放行 3425。
+- **Web 管理界面不对外**：保持默认的本机监听，只通过 SSH 隧道打开。
+- **每个客户端用单独的网关密钥**，并设好用量上限；某个泄露了，只停用它一个就行。
+- **注意 Docker 会绕过 ufw 和 firewalld**：Docker 发布的端口直接写进 iptables，系统防火墙里的规则**拦不住**它。要限制访问，请用**云服务器的安全组**，或者 `--allow-ips`。
 - **`.env` 和 `backups/` 里有敏感信息**，只有 root 能读，不要提交到任何仓库。
-- 不要设置 `MAGPIE_TRUST_PROXY=1`：设置后，经过代理的请求会被当作本机请求，**不需要密钥就能使用**。
+- **不要设置 `MAGPIE_TRUST_PROXY=1`**：设置后，经过代理的请求会被当作本机请求，**不需要密钥就能使用**。
+
+以后如果需要加密，最省事的是用 VPN（Tailscale、WireGuard）把客户端和服务器连起来，网关照样用 HTTP；或者看附录 A。
 
 ---
 
@@ -343,57 +372,29 @@ sudo docker exec magpie sh -c 'ulimit -n; cat /proc/sys/net/core/somaxconn'
 
 ### 9.1 安装时提示拉取镜像失败（unauthorized / denied）
 
-镜像是私有的。按 2.4 节传入 `GHCR_USER` 和 `GHCR_TOKEN`，或者把镜像改成公开。
+镜像是私有的。按 2.3 节传入 `GHCR_USER` 和 `GHCR_TOKEN`，或者把镜像改成公开。
 
-### 9.2 HTTPS 不生效，证书申请失败
+### 9.2 客户端连不上网关
 
-执行 `magpiectl logs caddy` 查看原因，常见的有：
+按顺序检查：
 
-- 域名的 DNS 还没指向这台服务器，或者还没生效；
-- 云服务器的安全组没有放行 80 和 443；
-- 80 或 443 被别的程序占用了（安装时脚本会提示）。
+1. 在服务器上：`curl http://127.0.0.1:3425/v1/models`，能返回就说明 magpie 本身正常；
+2. `magpiectl status` 里 magpie 是 `healthy`；
+3. 云服务器的**安全组**放行了 3425（Docker 绕过系统防火墙，但安全组是在云平台那一层的）；
+4. `--public` 填的 IP 是客户端能访问到的那个；
+5. 设置了 `--allow-ips` 的话，客户端的 IP 在列表里。被拒绝的请求会返回 403，日志里会写出请求来自哪个地址：`magpiectl logs`。
 
-修好以后执行 `sudo magpiectl restart`。
+### 9.3 返回 401
 
-### 9.3 我想用自己的 nginx
+没带网关密钥，或者密钥被停用了。请求头要带 `Authorization: Bearer sk-magpie-key-...`（Anthropic 客户端是 `x-api-key`）。
 
-安装时不要加 `--domain`，让 nginx 把请求转发到 `127.0.0.1:3430`。必须的配置：
-
-```nginx
-location / {
-    proxy_pass http://127.0.0.1:3430;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;   # 必须有
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_buffering off;                 # 流式输出逐块发送
-    proxy_request_buffering off;
-    proxy_read_timeout 3600s;            # 长请求
-    proxy_send_timeout 3600s;
-    client_max_body_size 100m;           # 长上下文的请求体很大
-}
-```
-
-再执行 `sudo magpiectl install --public-url https://你的域名`，让 magpie 显示正确的地址。
-
-### 9.4 想限制只有某些 IP 能访问
-
-- **不配域名时**：`sudo magpiectl install --allow-ips 203.0.113.7,10.0.0.0/8`。
-- **配了域名时**：magpie 看到的是 Caddy 的地址，而不是客户端的，所以要在 Caddy 那一层限制。编辑 `/opt/magpie/caddy/Caddyfile`：
-  ```
-  {$MAGPIE_DOMAIN} {
-      @blocked not remote_ip 203.0.113.7 10.0.0.0/8
-      respond @blocked 403
-      reverse_proxy magpie:3430 {
-          flush_interval -1
-      }
-  }
-  ```
-  然后执行 `sudo docker restart magpie-caddy`。注意：之后再运行 `magpiectl install` 会重新生成这个文件（旧的留在 `Caddyfile.bak`），需要重新改一次。
-
-### 9.5 并发上去以后请求要等很久才失败
+### 9.4 并发上去以后请求要等很久才失败
 
 并发达到了插件并发上限。用 `magpiectl status` 看当前的上限，用 `sudo magpiectl install --streams 4096` 调大。也可以按 5.2 节设置排队上限，让超载时快速返回 429。
+
+### 9.5 SSH 隧道打开后，Web 界面提示 401
+
+链接里要带 `?k=<key>`，用 `magpiectl url` 再看一次完整的链接。
 
 ### 9.6 升级后有问题
 
@@ -407,3 +408,33 @@ sudo rm /usr/local/bin/magpiectl /etc/sysctl.d/99-magpie.conf /etc/systemd/syste
 sudo sysctl --system
 # 确认不再需要数据之后，再删除 /opt/magpie
 ```
+
+---
+
+## 附录 A：以后想用域名和 HTTPS
+
+现在不需要，可以跳过。有了域名以后：
+
+1. 域名的 A 记录指向服务器，安全组放行 80 和 443；
+2. 执行：
+   ```bash
+   sudo magpiectl install --domain gw.example.com
+   ```
+
+脚本会启动一个 Caddy 容器，自动申请和续期 Let's Encrypt 证书。之后网关是 `https://gw.example.com/v1`，Web 界面是 `https://gw.example.com/?k=...`，magpie 自己的端口会改回只在本机监听。
+
+注意：用域名时 magpie 看到的是 Caddy 的地址，所以不能用 `--allow-ips`（脚本会拒绝），要在 `/opt/magpie/caddy/Caddyfile` 里限制：
+
+```
+{$MAGPIE_DOMAIN} {
+	@blocked not remote_ip 203.0.113.7 10.0.0.0/8
+	respond @blocked 403
+	reverse_proxy magpie:3430 {
+		flush_interval -1
+	}
+}
+```
+
+改完执行 `sudo docker restart magpie-caddy`。之后再运行 `magpiectl install` 会重新生成这个文件（旧的留在 `Caddyfile.bak`），需要重新改一次。
+
+想换回纯 IP：`sudo magpiectl install --public <IP>`。

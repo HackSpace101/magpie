@@ -213,7 +213,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags "nogui packedassets" -trimp
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/HackSpace101/magpie/main/deploy/docker/magpie.sh
-sudo bash magpie.sh install --domain gw.example.com    # 安装，自动配好 HTTPS 和系统参数
+sudo bash magpie.sh install --public <服务器IP>    # 安装：纯 IP 加 HTTP，自动调好系统参数
 sudo magpiectl upgrade                                  # 以后升级
 ```
 

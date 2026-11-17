@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # magpie.sh — one-command Docker deployment of this fork's magpie gateway.
 #
-#   sudo bash magpie.sh install [options]   first install, or re-run to apply new options
+#   sudo bash magpie.sh install --public IP  first install (plain HTTP on IP), or again to change options
 #   sudo magpiectl upgrade [--tag T]           pull a new image and switch to it, rolling back on failure
 #   sudo magpiectl rollback                    back to the image before the last upgrade
 #   magpiectl status | logs | url | version    look at it
@@ -87,6 +87,13 @@ random_key() {
 env_get() {
 	[ -f "$ENV_FILE" ] || return 0
 	awk -v k="$1" 'index($0, k "=") == 1 { v = substr($0, length(k) + 2) } END { if (v != "") print v }' "$ENV_FILE"
+}
+
+# env_get_at FILE KEY DEFAULT is env_get on FILE, DEFAULT when it has none
+env_get_at() {
+	local v
+	v=$(ENV_FILE=$1 env_get "$2")
+	printf '%s' "${v:-$3}"
 }
 
 # env_set KEY VALUE writes KEY=VALUE into $ENV_FILE, replacing the line it had
@@ -239,7 +246,8 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
     ports:
       - "${MAGPIE_BIND:-127.0.0.1}:${MAGPIE_GATEWAY_PORT:-3425}:3425"
-      - "${MAGPIE_BIND:-127.0.0.1}:${MAGPIE_WEB_PORT:-3430}:3430"
+      # the web UI holds magpie's admin key: on this host only unless --web-bind
+      - "${MAGPIE_WEB_BIND:-127.0.0.1}:${MAGPIE_WEB_PORT:-3430}:3430"
     volumes:
       - ./config:/config
 
@@ -288,7 +296,7 @@ usage() {
 	cat <<'EOF'
 magpie.sh — one-command Docker deployment of this fork's magpie gateway.
 
-  sudo bash magpie.sh install [options]   first install, or again to change options
+  sudo bash magpie.sh install --public IP  first install (plain HTTP on IP), or again to change options
   sudo magpiectl upgrade [--tag T]        pull a new image and switch to it, back on failure
   sudo magpiectl rollback [--restore F]   back to the image before the last upgrade
   magpiectl status | logs [svc] | url     look at it
@@ -301,19 +309,23 @@ magpie.sh — one-command Docker deployment of this fork's magpie gateway.
 EOF
 	cat <<EOF
 install options:
+  --public IP         serve the gateway to other machines on this host's IP, over
+                      plain HTTP (http://IP:3425); the web UI stays on this host
   --dir DIR           where it all lives (default $DEFAULT_DIR)
   --image IMAGE       the image, without a tag (default $DEFAULT_IMAGE)
   --tag TAG           the image tag (default latest)
-  --domain NAME       serve HTTPS on NAME through Caddy (ports 80 and 443)
-  --no-domain         stop serving HTTPS through Caddy
-  --bind ADDR         the host address magpie's own ports are published on
+  --bind ADDR         the host address the gateway's port is published on
                       (default 127.0.0.1; 0.0.0.0 for every interface)
+  --web-bind ADDR     the same for the web UI's port (default 127.0.0.1: reach
+                      it through ssh -L); 0.0.0.0 sends its admin key in the clear
   --gateway-port N    the host port for the gateway (default 3425)
   --web-port N        the host port for the web UI (default 3430)
   --streams N         MAGPIE_PLUGIN_STREAMS, plugin fetches at once (default 2048)
   --public-url URL    MAGPIE_PUBLIC_URL, the gateway's address for others
-  --allow-ips LIST    MAGPIE_ALLOW_IPS (not with --domain: behind Caddy magpie sees Caddy's address)
+  --allow-ips LIST    MAGPIE_ALLOW_IPS: only these addresses may call magpie (off: any)
   --tz ZONE           the container's time zone (default Asia/Shanghai)
+  --domain NAME       optional: HTTPS on NAME through Caddy (ports 80 and 443)
+  --no-domain         stop serving HTTPS through Caddy
   --no-tune           leave the host's kernel and file limits alone
   --install-docker    install Docker when it is missing, without asking
   --dry-run           print what it would write, change nothing
@@ -374,7 +386,7 @@ check_ports() {
 }
 
 cmd_install() {
-	local tag='' domain='' no_domain=0 bind='' gw_port='' web_port='' streams='' public_url='' allow_ips='' tz='' tune=1 image=''
+	local tag='' domain='' no_domain=0 bind='' web_bind='' public_ip='' gw_port='' web_port='' streams='' public_url='' allow_ips='' tz='' tune=1 image=''
 	DIR=${MAGPIE_DIR:-$DEFAULT_DIR}
 	INSTALL_DOCKER=0
 	while [ $# -gt 0 ]; do
@@ -385,6 +397,8 @@ cmd_install() {
 		--domain) domain=${2:?}; shift ;;
 		--no-domain) no_domain=1 ;;
 		--bind) bind=${2:?}; shift ;;
+		--web-bind) web_bind=${2:?}; shift ;;
+		--public) public_ip=${2:?--public needs this host IP}; shift ;;
 		--gateway-port) gw_port=${2:?}; shift ;;
 		--web-port) web_port=${2:?}; shift ;;
 		--streams) streams=${2:?}; shift ;;
@@ -408,8 +422,17 @@ cmd_install() {
 	for p in "$gw_port" "$web_port" "$streams"; do
 		[ -z "$p" ] || [[ $p =~ ^[0-9]+$ ]] || die "not a number: $p"
 	done
-	if [ -n "$domain" ] && [ -n "$allow_ips" ]; then
+	if [ -n "$domain" ] && [ -n "$allow_ips" ] && [ "$allow_ips" != off ]; then
 		die "--allow-ips with --domain would shut everyone out: behind Caddy, magpie sees Caddy's address, not the client's. Limit addresses in caddy/Caddyfile instead (docs/fork/deploy-docker.md)"
+	fi
+	if [ -n "$public_ip" ]; then
+		[ -z "$domain" ] || die "--public is plain HTTP on an IP; --domain is HTTPS on a name: give one of them"
+		[[ $public_ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || $public_ip == *:* ]] || die "--public takes this host's IP address, not $public_ip"
+		bind=0.0.0.0
+		no_domain=1
+		local shown=$public_ip
+		[[ $public_ip == *:* ]] && shown="[$public_ip]"
+		public_url=${public_url:-http://$shown:${gw_port:-$(env_get_at "$DIR/.env" MAGPIE_GATEWAY_PORT 3425)}}
 	fi
 	ENV_FILE=$DIR/.env
 
@@ -442,7 +465,11 @@ cmd_install() {
 	[ -n "$web_port" ] && env_set MAGPIE_WEB_PORT "$web_port"
 	[ -n "$tz" ] && env_set TZ "$tz"
 	[ -n "$(env_get TZ)" ] || env_set TZ Asia/Shanghai
-	[ -n "$allow_ips" ] && env_set MAGPIE_ALLOW_IPS "$allow_ips"
+	if [ "$allow_ips" = off ]; then
+		env_set MAGPIE_ALLOW_IPS ""
+	elif [ -n "$allow_ips" ]; then
+		env_set MAGPIE_ALLOW_IPS "$allow_ips"
+	fi
 	if [ -n "$domain" ]; then
 		env_set MAGPIE_DOMAIN "$domain"
 		env_set MAGPIE_PUBLIC_URL "${public_url:-https://$domain}"
@@ -458,13 +485,16 @@ cmd_install() {
 	if [ -n "$(env_get MAGPIE_DOMAIN)" ]; then
 		env_set COMPOSE_PROFILES https
 		bind=127.0.0.1
+		web_bind=127.0.0.1
 	else
 		env_set COMPOSE_PROFILES ""
 	fi
 	[ -n "$bind" ] && env_set MAGPIE_BIND "$bind"
 	[ -n "$(env_get MAGPIE_BIND)" ] || env_set MAGPIE_BIND 127.0.0.1
-	if [ "$(env_get MAGPIE_BIND)" != 127.0.0.1 ] && [ -z "$(env_get MAGPIE_DOMAIN)" ]; then
-		warn "magpie's ports are published on $(env_get MAGPIE_BIND) without HTTPS: keys and the web UI cross the network in the clear"
+	[ -n "$web_bind" ] && env_set MAGPIE_WEB_BIND "$web_bind"
+	[ -n "$(env_get MAGPIE_WEB_BIND)" ] || env_set MAGPIE_WEB_BIND 127.0.0.1
+	if [ "$(env_get MAGPIE_WEB_BIND)" != 127.0.0.1 ] && [ -z "$(env_get MAGPIE_DOMAIN)" ]; then
+		warn "the web UI is published on $(env_get MAGPIE_WEB_BIND) over plain HTTP: its link carries magpie's admin key in the clear. Without --web-bind it stays on this host (ssh -L)"
 	fi
 
 	# compose.yaml and the Caddyfile are this script's; an older one is kept as .bak
@@ -530,30 +560,38 @@ cmd_install() {
 }
 
 cmd_url() {
-	local key bind port domain
+	local key bind web_bind port gp domain public
 	key=$(env_get MAGPIE_WEB_KEY)
 	bind=$(env_get MAGPIE_BIND)
+	web_bind=$(env_get MAGPIE_WEB_BIND)
+	web_bind=${web_bind:-127.0.0.1}
 	port=$(env_get MAGPIE_WEB_PORT)
 	port=${port:-3430}
+	gp=$(env_get MAGPIE_GATEWAY_PORT)
+	gp=${gp:-3425}
 	domain=$(env_get MAGPIE_DOMAIN)
+	public=$(env_get MAGPIE_PUBLIC_URL)
 	say "${c_bold}Web UI${c_off}"
 	if [ -n "$domain" ]; then
 		say "  https://$domain/?k=$key"
 	fi
-	if [ "$bind" = 127.0.0.1 ]; then
-		say "  http://127.0.0.1:$port/?k=$key   ${c_dim}(on this host; from your computer: ssh -L $port:127.0.0.1:$port <this host>)${c_off}"
+	if [ "$web_bind" = 127.0.0.1 ]; then
+		say "  http://127.0.0.1:$port/?k=$key"
+		say "  ${c_dim}on this host only. From your computer: ssh -L $port:127.0.0.1:$port <user>@<this host>, then open the link above${c_off}"
 	else
 		say "  http://<this host>:$port/?k=$key"
 	fi
-	say "${c_bold}Gateway${c_off} (each client needs a gateway key)"
+	say "${c_bold}Gateway${c_off} (every client sends a gateway key: sudo magpiectl key add <name>)"
 	if [ -n "$domain" ]; then
 		say "  OpenAI: https://$domain/v1    Anthropic / Gemini: https://$domain"
+	elif [ -n "$public" ]; then
+		say "  OpenAI: ${public%/}/v1    Anthropic / Gemini: ${public%/}"
+	elif [ "$bind" = 127.0.0.1 ]; then
+		say "  OpenAI: http://127.0.0.1:$gp/v1    ${c_dim}(this host only; install --public <IP> serves other machines)${c_off}"
 	else
-		local gp
-		gp=$(env_get MAGPIE_GATEWAY_PORT)
-		say "  OpenAI: http://<host>:${gp:-3425}/v1    Anthropic / Gemini: http://<host>:${gp:-3425}"
+		say "  OpenAI: http://<this host>:$gp/v1    Anthropic / Gemini: http://<this host>:$gp"
 	fi
-	say "${c_dim}The link carries the web key; anyone with it can change magpie. Keep it to yourself.${c_off}"
+	say "${c_dim}The web link carries magpie's admin key; anyone with it can change magpie. Keep it to yourself.${c_off}"
 }
 
 # backup_config [label] writes backups/config-<time>[-label].tar.gz, without
