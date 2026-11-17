@@ -2,7 +2,7 @@
 
 这份文档讲这个 fork 和上游 [yetone/magpie](https://github.com/yetone/magpie) 有什么不同，以及怎么自动同步上游、怎么编译。
 
-**部署请看 [Docker 一键部署和升级](deploy-docker.md)。**
+**部署请看 [Docker 部署](deploy-docker.md)。**
 
 ---
 
@@ -59,12 +59,12 @@
 - 账号很多、token 刷新很频繁时，账号文件 `plugin-auth.json` 的读写；
 - 用量记录、网关自身对每个请求的处理开销。
 
-所以**上线前请用接近真实的流量压测一次**（见 [部署文档 5.3 节](deploy-docker.md#53-上线前压测)），重点看 Bun 进程的 CPU。
+所以**上线前请用接近真实的流量压测一次**（见 [部署文档第 5 节](deploy-docker.md#5-设置)），重点看 Bun 进程的 CPU。
 
 ### 1.3 没有改的
 
 - **网关请求钩子**（带 `onRequest` 一类网关钩子的插件）也有一个 128 的上限，写在 `internal/plugin/host.js` 的 `GATEWAY_RUN_LIMIT` 里。超过时，那个请求会跳过钩子、照常转发，而不是失败。只用供应商插件的话，碰不到这个限制。
-- **网关这一层的限流**（每个账号的并发、排队、RPM 等）还是 magpie 原来的机制，默认都不限制，按需配置（见 [部署文档 5.2 节](deploy-docker.md#52-每个账号的限流)）。
+- **网关这一层的限流**（每个账号的并发、排队、RPM 等）还是 magpie 原来的机制，默认都不限制，按需配置（见 [部署文档第 5 节](deploy-docker.md#5-设置)）。
 
 ---
 
@@ -149,7 +149,7 @@ Actions → **Fork sync** → **Run workflow**。成功以后，`main` 上会多
 
 ### 3.4 什么时候升级部署
 
-同步只会更新代码，**不会自动更新你正在运行的网关**。部署的版本完全由你控制：需要的时候运行一次 **Fork build**，再按 [部署文档第 3 节](deploy-docker.md#3-一键升级) 升级。考虑到上游一天可能有上百个提交，建议：
+同步只会更新代码，**不会自动更新你正在运行的网关**。部署的版本完全由你控制：需要的时候运行一次 **Fork build**，再按 [部署文档第 4 节](deploy-docker.md#4-升级和回滚) 升级。考虑到上游一天可能有上百个提交，建议：
 
 - 固定一个版本上线，不要每次同步都升级；
 - 隔几天或一周，挑低峰时段升级一次；
@@ -209,7 +209,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags "nogui packedassets" -trimp
 
 ## 5. 部署
 
-**部署单独写在 [Docker 一键部署和升级](deploy-docker.md) 里。** 一句话版本：
+**部署单独写在 [Docker 部署](deploy-docker.md) 里。** 一句话版本：
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/HackSpace101/magpie/main/deploy/docker/magpie.sh
