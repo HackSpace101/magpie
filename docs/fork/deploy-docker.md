@@ -11,6 +11,7 @@
 升级    sudo magpiectl upgrade
 回滚    sudo magpiectl rollback
 状态    magpiectl status
+改用域名  sudo magpiectl install --domain <域名>   （HTTPS，见附录 A）
 ```
 
 ---
@@ -411,25 +412,95 @@ sudo sysctl --system
 
 ---
 
-## 附录 A：以后想用域名和 HTTPS
+## 附录 A：改用域名和 HTTPS（完整步骤）
 
-现在不需要，可以跳过。有了域名以后：
+纯 IP 用得好好的话可以跳过。有了自己的域名、想让流量加密时，照下面一步步做。下文用 `gw.example.com` 举例，**换成你自己的子域名**（比如在你的域名下建一个 `gw` 子域名）。
 
-1. 给一个子域名（如 `gw.example.com`）加 A 记录，指向服务器 IP。用 Cloudflare 的话要设成 **仅 DNS（灰色云朵）**：它的代理会切断长时间的流式回复（免费版 100 秒），还会让 Caddy 签不下证书；
-2. 安全组放行 TCP 80 和 443（UDP 443 可选，用于 HTTP/3）。80 用来签证书，不能关；
-3. 等 `dig +short gw.example.com` 返回服务器 IP 以后再执行：
-   ```bash
-   sudo magpiectl install --domain gw.example.com
-   # 之前用 --public 设过 --allow-ips 的话，要一并去掉，否则脚本会拒绝：
-   sudo magpiectl install --domain gw.example.com --allow-ips off
-   ```
-4. `magpiectl logs caddy` 里看到 `certificate obtained successfully` 就好了。之后 3425 端口可以从安全组里关掉。
+改用域名以后的样子：
 
-服务器在中国大陆的话，域名要先备案，否则云厂商会拦截 80/443 的访问。
+| | 纯 IP（现在） | 域名（改完以后） |
+| --- | --- | --- |
+| 网关地址 | `http://<服务器IP>:3425/v1` | `https://gw.example.com/v1` |
+| Web 管理界面 | SSH 隧道后打开 `http://127.0.0.1:3430/?k=...` | 直接打开 `https://gw.example.com/?k=...` |
+| 流量 | 明文 | 加密（Let's Encrypt 证书，自动续期） |
+| 安全组要放行 | TCP 3425 | TCP 80、443（UDP 443 可选） |
+| 限制来源 IP | `--allow-ips` | 改 `caddy/Caddyfile`（见 A.6） |
 
-脚本会启动一个 Caddy 容器，自动申请和续期 Let's Encrypt 证书。之后网关是 `https://gw.example.com/v1`，Web 界面是 `https://gw.example.com/?k=...`，magpie 自己的端口会改回只在本机监听。
+网关密钥、插件、账号、用量记录都**不受影响**，客户端只需要换地址。
 
-注意：用域名时 magpie 看到的是 Caddy 的地址，所以不能用 `--allow-ips`（脚本会拒绝，`--public` 时留下的也一样），要在 `/opt/magpie/caddy/Caddyfile` 里限制：
+### A.1 第一步：加 DNS 记录
+
+在域名的 DNS 服务商那里加一条记录：
+
+| 类型 | 主机记录（名称） | 记录值 |
+| --- | --- | --- |
+| A | `gw` | 服务器的公网 IPv4 |
+| AAAA（可选，服务器有公网 IPv6 时） | `gw` | 服务器的公网 IPv6 |
+
+**域名托管在 Cloudflare 的话，代理状态一定要设成"仅 DNS"（灰色云朵），不要开橙色云朵。** 开着代理，Cloudflare 会切断超过 100 秒的流式回复（免费版），长回答会断在半路；Caddy 也签不下证书。
+
+### A.2 第二步：放行端口
+
+在云服务器的**安全组**里放行（前面说过，系统防火墙拦不住 Docker 的端口，以安全组为准）：
+
+- **TCP 80**：申请和续期证书要用，**不能关**，关了证书到期就续不上；
+- **TCP 443**：HTTPS 本身；
+- UDP 443：可选，用于 HTTP/3。
+
+3425 先别关，等第五步确认域名能用以后再关。
+
+**服务器在中国大陆的话，域名必须先备案**，否则云厂商会拦截 80 和 443 的访问，表现为证书申请失败或网页打不开。香港和海外的服务器不需要备案。
+
+### A.3 第三步：确认 DNS 已经生效
+
+在服务器上（或者自己电脑上）执行：
+
+```bash
+dig +short gw.example.com          # 没有 dig 的话：nslookup gw.example.com
+```
+
+返回的是服务器的公网 IP 才算生效。新加的记录一般几分钟就好，个别服务商要等更久。**没生效就去签证书，会失败**，失败多了 Let's Encrypt 会暂时限制这个域名（见 A.8）。
+
+### A.4 第四步：切换到域名
+
+```bash
+sudo magpiectl self-update                          # 先把脚本更新到最新
+sudo magpiectl install --domain gw.example.com
+```
+
+之前用 `--public` 设过 `--allow-ips` 的话，脚本会拒绝并提示你，要一并去掉：
+
+```bash
+sudo magpiectl install --domain gw.example.com --allow-ips off
+```
+
+原因是：用域名时请求先到 Caddy，magpie 看到的来源地址都是 Caddy 的，白名单会把所有客户端挡在外面。来源 IP 的限制改在 Caddy 里做（A.6）。
+
+脚本会做这些事：在 `.env` 里写上域名，启动一个 Caddy 容器（`magpie-caddy`，占用 80 和 443），把 magpie 自己的 3425 和 3430 改成只在服务器本机监听。原来的设置和数据都保留。
+
+### A.5 第五步：检查和改客户端
+
+```bash
+magpiectl logs caddy        # 看到 certificate obtained successfully 就是证书签好了
+magpiectl status
+magpiectl url               # 打印新的网关地址和 Web 界面链接
+```
+
+再用一个网关密钥试一下（`sk-...` 换成你的密钥）：
+
+```bash
+curl -s https://gw.example.com/v1/models -H "Authorization: Bearer sk-..." | head -c 300
+```
+
+能返回模型列表就成功了。接下来：
+
+1. 把所有客户端的地址从 `http://<服务器IP>:3425/v1` 改成 `https://gw.example.com/v1`，密钥不用换；
+2. Web 管理界面直接打开 `magpiectl url` 给出的 `https://gw.example.com/?k=...`，不再需要 SSH 隧道。**这个链接里带着管理密钥，不要发给别人**；
+3. 确认客户端都切过来以后，从安全组里删掉 3425 的放行规则（它现在本来也只在本机监听了）。
+
+### A.6 限制来源 IP（可选）
+
+改 `/opt/magpie/caddy/Caddyfile`，在里面加上允许的地址：
 
 ```
 {$MAGPIE_DOMAIN} {
@@ -441,6 +512,37 @@ sudo sysctl --system
 }
 ```
 
-改完执行 `sudo docker restart magpie-caddy`。之后再运行 `magpiectl install` 会重新生成这个文件（旧的留在 `Caddyfile.bak`），需要重新改一次。
+`remote_ip` 后面写允许的 IP 或网段，用空格隔开；其他地址会收到 403。改完执行：
 
-想换回纯 IP：`sudo magpiectl install --public <IP>`。
+```bash
+sudo docker restart magpie-caddy
+```
+
+注意：以后**每次运行 `magpiectl install`，这个文件都会被重新生成**（旧的留在 `caddy/Caddyfile.bak`），要把这两行再加回去。`magpiectl upgrade` 不会动它。
+
+### A.7 以后的升级和维护
+
+- 升级照旧：`sudo magpiectl upgrade`，域名设置会保留；
+- 证书 Caddy 自己续期，不用管，只要 80 端口一直开着；
+- 证书存在 `/opt/magpie/caddy/data`，不要删，删了会重新申请。
+
+### A.8 出问题时
+
+| 现象 | 原因和办法 |
+| --- | --- |
+| `logs caddy` 里证书申请失败，提到 `timeout`、`connection refused` | 80 或 443 没放行，或者大陆服务器没备案被拦截 |
+| 提到 `NXDOMAIN`、`no valid A records`，或者 IP 不对 | DNS 没生效或写错了，回到 A.3 |
+| 提到 `rateLimited` / `too many failed authorizations` | 失败次数太多被 Let's Encrypt 暂时限制，修好上面的问题后等一小时再 `sudo docker restart magpie-caddy` |
+| 浏览器能打开，但长回答中途断掉 | Cloudflare 开了橙色云朵，改成灰色 |
+| 所有请求都是 403 | Caddyfile 里的 `remote_ip` 没包含你的 IP |
+| 所有请求都是 401 | 没带网关密钥，或者密钥不对。走域名时每个请求都需要密钥 |
+| `install` 提示 `allow list ... would shut everyone out` | 加上 `--allow-ips off`，见 A.4 |
+| 80 或 443 被占用 | 服务器上还有别的 Nginx、Apache 等，先停掉，或者换一台机器 |
+
+### A.9 换回纯 IP
+
+```bash
+sudo magpiectl install --public <服务器IP>
+```
+
+脚本会删掉 Caddy 容器，3425 重新对外开放。记得把安全组的 3425 加回去，客户端地址改回 `http://<服务器IP>:3425/v1`。需要白名单的话照常加 `--allow-ips`。
