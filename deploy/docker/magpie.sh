@@ -19,7 +19,7 @@
 # Docs: docs/fork/deploy-docker.md
 set -Eeuo pipefail
 
-SCRIPT_VERSION=2026.11.18
+SCRIPT_VERSION=2026.11.18.2
 DEFAULT_DIR=/opt/magpie
 DEFAULT_IMAGE=ghcr.io/hackspace101/magpie-gateway
 DEFAULT_SCRIPT_URL=https://raw.githubusercontent.com/HackSpace101/magpie/main/deploy/docker/magpie.sh
@@ -469,6 +469,12 @@ install options:
   --tz ZONE           the container's time zone (default Asia/Shanghai)
   --domain NAME       optional: HTTPS on NAME through Caddy (ports 80 and 443)
   --no-domain         stop serving HTTPS through Caddy
+  --caddy-image IMG   Caddy's image (default caddy:2, or through a Docker Hub
+                      mirror when this host can't reach Docker Hub)
+  --import-from NAME  take the data of a magpie container already here (an
+                      upstream one): it is stopped, renamed NAME-before-fork
+                      and kept with its volume; its data is copied into
+                      <dir>/config, which must be empty
   --no-tune           leave the host's kernel and file limits alone
   --install-docker    install Docker when it is missing, without asking
   --dry-run           print what it would write, change nothing
@@ -484,7 +490,31 @@ ensure_docker() {
 		return 0
 	fi
 	if command -v docker >/dev/null 2>&1; then
-		die "Docker is here but the Compose plugin isn't: install docker-compose-plugin (apt install docker-compose-plugin / dnf install docker-compose-plugin)"
+		# Ubuntu's and Debian's own docker.io comes without Compose, which
+		# they package as docker-compose-v2; Docker's own repo calls it
+		# docker-compose-plugin
+		local pkg=''
+		if command -v apt-get >/dev/null 2>&1; then
+			for pkg in docker-compose-v2 docker-compose-plugin ''; do
+				# read whole: grep -q would end the pipe early, which pipefail counts as a failure
+				[ -n "$pkg" ] && [[ $(apt-cache policy "$pkg" 2>/dev/null) == *'Candidate: '[0-9]* ]] && break
+			done
+		elif command -v dnf >/dev/null 2>&1; then
+			pkg=docker-compose-plugin
+		fi
+		[ -n "$pkg" ] || die "Docker is here but its Compose plugin isn't: https://docs.docker.com/compose/install/linux/"
+		if [ "$INSTALL_DOCKER" = 1 ] || confirm "Docker is here but its Compose plugin isn't. Install $pkg now?"; then
+			step "Installing $pkg"
+			if command -v apt-get >/dev/null 2>&1; then
+				DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$pkg" >/dev/null
+			else
+				dnf install -y -q "$pkg" >/dev/null
+			fi
+			docker compose version >/dev/null 2>&1 || die "$pkg installed, but docker compose doesn't run"
+			ok "Compose $(docker compose version --short 2>/dev/null)"
+			return 0
+		fi
+		die "Docker is here but its Compose plugin isn't: install $pkg (or run again with --install-docker)"
 	fi
 	if [ "$INSTALL_DOCKER" = 1 ] || confirm "Docker isn't installed. Install it now with get.docker.com?"; then
 		step "Installing Docker"
@@ -510,6 +540,29 @@ registry_login() {
 	ok "signed in (docker keeps it in ~/.docker/config.json)"
 }
 
+# pick_caddy_image: Caddy comes from Docker Hub (caddy:2), which hosts in
+# mainland China often can't reach; there it is taken through a mirror of
+# Docker Hub instead, once, and kept in .env (CADDY_IMAGE). --caddy-image
+# names one by hand.
+CADDY_MIRRORS="docker.m.daocloud.io docker.1ms.run"
+pick_caddy_image() {
+	[ -z "$(env_get CADDY_IMAGE)" ] || return 0
+	if curl -s -o /dev/null -m 8 https://registry-1.docker.io/v2/; then
+		env_set CADDY_IMAGE caddy:2
+		return 0
+	fi
+	local m
+	for m in $CADDY_MIRRORS; do
+		if curl -s -o /dev/null -m 8 "https://$m/v2/"; then
+			env_set CADDY_IMAGE "$m/library/caddy:2"
+			warn "Docker Hub doesn't answer from this host: Caddy comes through the mirror $m (CADDY_IMAGE in .env; --caddy-image sets another)"
+			return 0
+		fi
+	done
+	env_set CADDY_IMAGE caddy:2
+	warn "neither Docker Hub nor a mirror of it answers from this host; pulling caddy:2 may fail (--caddy-image names one that can be pulled)"
+}
+
 # check_ports warns when a port this install publishes is held by something
 # other than its own containers
 check_ports() {
@@ -524,7 +577,7 @@ check_ports() {
 	mine=$(docker ps -q --filter name='^magpie' 2>/dev/null || true)
 	[ -n "$mine" ] && return 0 # re-run: the ports are its own
 	for p in "${ports[@]}"; do
-		if ss -Hltn "sport = :$p" 2>/dev/null | grep -q .; then
+		if [ -n "$(ss -Hltn "sport = :$p" 2>/dev/null)" ]; then
 			warn "port $p is in use on this host: $(ss -Hltnp "sport = :$p" 2>/dev/null | awk '{print $NF}' | head -n 1)"
 		fi
 	done
@@ -532,7 +585,7 @@ check_ports() {
 
 cmd_install() {
 	local tag='' domain='' no_domain=0 bind='' web_bind='' public_ip='' gw_port='' web_port='' streams='' public_url='' allow_ips='' tz='' tune=1 image=''
-	local web_user='' web_password='' subnet=''
+	local web_user='' web_password='' subnet='' caddy_img='' import_from=''
 	DIR=${MAGPIE_DIR:-$DEFAULT_DIR}
 	INSTALL_DOCKER=0
 	while [ $# -gt 0 ]; do
@@ -553,6 +606,8 @@ cmd_install() {
 		--web-user) web_user=${2:?}; shift ;;
 		--web-password) web_password=${2:?}; shift ;;
 		--subnet) subnet=${2:?}; shift ;;
+		--caddy-image) caddy_img=${2:?}; shift ;;
+		--import-from) import_from=${2:?}; shift ;;
 		--tz) tz=${2:?}; shift ;;
 		--no-tune) tune=0 ;;
 		--install-docker) INSTALL_DOCKER=1 ;;
@@ -629,12 +684,16 @@ cmd_install() {
 	fi
 	[ -n "$(env_get MAGPIE_SUBNET)" ] || env_set MAGPIE_SUBNET 172.29.250.0/24
 	[ -n "$(env_get MAGPIE_CADDY_IP)" ] || env_set MAGPIE_CADDY_IP "$(subnet_host "$(env_get MAGPIE_SUBNET)" 10)"
+	[ -n "$caddy_img" ] && env_set CADDY_IMAGE "$caddy_img"
 	[ -n "$tz" ] && env_set TZ "$tz"
 	[ -n "$(env_get TZ)" ] || env_set TZ Asia/Shanghai
 	if [ "$allow_ips" = off ]; then
 		env_set MAGPIE_ALLOW_IPS ""
 	elif [ -n "$allow_ips" ]; then
 		env_set MAGPIE_ALLOW_IPS "$allow_ips"
+	elif ! grep -q '^MAGPIE_ALLOW_IPS=' "$ENV_FILE"; then
+		# written empty, so Compose doesn't warn it is unset
+		env_set MAGPIE_ALLOW_IPS ""
 	fi
 	if [ -n "$domain" ]; then
 		env_set MAGPIE_DOMAIN "$domain"
@@ -692,7 +751,8 @@ cmd_install() {
 
 	IMAGE=$(env_get MAGPIE_IMAGE)
 	registry_login
-	step "Pulling $(env_get MAGPIE_IMAGE_REF)"
+	pick_caddy_image
+	step "Pulling $(env_get MAGPIE_IMAGE_REF) and $(caddy_image)"
 	compose pull || die "couldn't pull the image. A private GHCR image needs GHCR_USER and GHCR_TOKEN (read:packages) set when you run this, or the package made public"
 	# pin the tag to what it is now, so a moving tag (latest) changes nothing until `magpiectl upgrade`
 	local ref digest
@@ -702,6 +762,8 @@ cmd_install() {
 
 	# the password's hash is made by the Caddy image just pulled
 	caddy_config
+
+	[ -z "$import_from" ] || import_container "$import_from"
 
 	step "Starting"
 	# a profile turned off leaves its container running: the other Caddy goes by hand
@@ -765,6 +827,31 @@ cmd_url() {
 		say "  OpenAI: http://<this host>:$gp/v1    Anthropic / Gemini: http://<this host>:$gp"
 	fi
 	say "${c_dim}Anyone with the web UI's password can change magpie. Keep it to yourself.${c_off}"
+}
+
+# import_container NAME takes over a magpie container already on this host
+# (an upstream install, `docker run … ghcr.io/yetone/magpie`): it stops
+# NAME, renames it NAME-before-fork with no restart, so it holds neither
+# the name nor the ports, and copies what it keeps in /config into
+# $DIR/config. NAME and its volume are left as they are: `docker start
+# NAME-before-fork` (after `docker compose down` here) puts it back.
+import_container() {
+	local name=$1 src kept
+	kept="$name-before-fork"
+	docker container inspect "$name" >/dev/null 2>&1 || die "--import-from: no container $name (docker ps -a)"
+	src=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/config"}}{{.Source}}{{end}}{{end}}' "$name")
+	[ -n "$src" ] && [ -d "$src" ] || die "--import-from: $name keeps no /config folder on this host; nothing to take"
+	if [ -n "$(ls -A "$DIR/config" 2>/dev/null)" ]; then
+		die "--import-from: $DIR/config holds data already; it takes data into an empty one only (move that folder away first)"
+	fi
+	step "Taking over $name (its data is in $src)"
+	docker update --restart=no "$name" >/dev/null
+	docker stop -t 30 "$name" >/dev/null
+	docker rename "$name" "$kept"
+	ok "stopped $name, kept as $kept with its volume (docker start $kept brings it back)"
+	cp -a "$src/." "$DIR/config/"
+	chown -R "$CONTAINER_UID:$CONTAINER_UID" "$DIR/config"
+	ok "copied its data ($(du -sh "$DIR/config" | cut -f1)) into $DIR/config"
 }
 
 # cmd_password [NEW] sets the web UI's password (a new random one when none
