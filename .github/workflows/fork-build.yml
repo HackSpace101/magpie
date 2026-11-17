@@ -3,7 +3,9 @@
 # magpie web). Run it from Actions › Fork build › Run workflow.
 #
 # It makes:
-# - binaries for the targets asked, as one artifact with SHA256SUMS;
+# - binaries for the targets asked, with SHA256SUMS, as a GitHub release
+#   tagged with the version (releases count against no Actions storage, as
+#   artifacts do);
 # - optionally a Docker image, ghcr.io/<owner>/magpie-gateway:<version> and
 #   :latest, from the repo's own Dockerfile.
 #
@@ -88,6 +90,9 @@ jobs:
     if: inputs.targets != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    permissions:
+      # the release and its tag
+      contents: write
     env:
       VERSION: ${{ needs.version.outputs.version }}
       TARGETS: ${{ inputs.targets }}
@@ -147,11 +152,21 @@ jobs:
           echo "web UI answered HTTP $web"
           case "$web" in 2*|3*) ;; *) echo "::error::the web UI didn't answer"; exit 1 ;; esac
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: magpie-gateway-${{ env.VERSION }}
-          path: dist/*
-          retention-days: 30
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          up=$(tr -d '[:space:]' < .fork/upstream)
+          notes="Built from $GITHUB_SHA, upstream yetone/magpie@$up. Binaries are the terminal build (gateway and web UI, no desktop app); SHA256SUMS lists their hashes."
+          # a run again at the same commit has the same version: its files
+          # replace the release's
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" dist/* --clobber
+          else
+            gh release create "$VERSION" dist/* --target "$GITHUB_SHA"               --title "magpie gateway $VERSION" --notes "$notes"
+          fi
+          echo "### Release: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$VERSION" >> "$GITHUB_STEP_SUMMARY"
 
   docker:
     needs: version

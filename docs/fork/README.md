@@ -172,7 +172,7 @@ Actions → **Fork build** → **Run workflow**，有四个选项：
 
 ### 4.1 产物
 
-- **二进制**：在这次运行页面底部的 **Artifacts** 里，名字是 `magpie-gateway-<版本>`，里面是 `magpie-gateway-linux-amd64` 等文件和 `SHA256SUMS`，保留 30 天。linux/amd64 的二进制在编译后还会做一次冒烟测试：启动网关和 Web 界面，确认都能响应。
+- **二进制**：发布在仓库的 **Releases** 里，tag 就是版本号，包括 `magpie-gateway-linux-amd64` 等文件和 `SHA256SUMS`。Release 不占用 Actions 的存储额度。linux/amd64 的二进制在编译后还会做一次冒烟测试：启动网关和 Web 界面，确认都能响应。
 - **Docker 镜像**：`ghcr.io/<你的用户名小写>/magpie-gateway:<版本>` 和 `:latest`。运行摘要里有完整的 `docker pull` 命令。
 
 ### 4.2 版本号，以及为什么它不会自己更新
