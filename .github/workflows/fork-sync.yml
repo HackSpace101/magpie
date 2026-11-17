@@ -78,6 +78,9 @@ jobs:
           go test -tags nogui -count=1 \
             -run 'TestForkStreams|TestForkHostTakesMoreThanUpstreamsStreams|TestHostAdmissionLimitFailsTheNewCall|TestHostFetchWaitsForAStreamWindow' \
             ./internal/plugin
+          # the Docker deploy's Caddy lets the gateway's client routes past
+          # the web UI's password: its list must still be upstream's routes
+          go test -tags nogui -count=1 -run '^TestForkCaddyClientPaths$' ./internal/gateway
 
       - name: Push
         if: steps.sync.outputs.changed == 'true'

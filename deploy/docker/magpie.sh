@@ -5,6 +5,7 @@
 #   sudo magpiectl upgrade [--tag T]           pull a new image and switch to it, rolling back on failure
 #   sudo magpiectl rollback                    back to the image before the last upgrade
 #   magpiectl status | logs | url | version    look at it
+#   sudo magpiectl password [NEW]              the web UI's password
 #   sudo magpiectl backup                      a backup of the data folder
 #   sudo magpiectl key add <name>              a gateway key for a client
 #   sudo magpiectl tune                        the host's kernel and file limits only
@@ -13,12 +14,12 @@
 # install copies this script to <dir>/magpie.sh and links /usr/local/bin/magpiectl
 # to it. Everything else lives in <dir> (default /opt/magpie): compose.yaml,
 # .env (the web key and settings, mode 600), config/ (magpie's data),
-# caddy/ (HTTPS), backups/. No secret is ever written into the repo.
+# caddy/ (Caddy, in front of the web UI), backups/. No secret is ever written into the repo.
 #
 # Docs: docs/fork/deploy-docker.md
 set -Eeuo pipefail
 
-SCRIPT_VERSION=2026.11.17
+SCRIPT_VERSION=2026.11.18
 DEFAULT_DIR=/opt/magpie
 DEFAULT_IMAGE=ghcr.io/hackspace101/magpie-gateway
 DEFAULT_SCRIPT_URL=https://raw.githubusercontent.com/HackSpace101/magpie/main/deploy/docker/magpie.sh
@@ -234,25 +235,50 @@ services:
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
-    # the gateway (3425) and the web UI (3430); the web port answers the
-    # gateway's /v1 routes too, with a gateway key
+    # the gateway (3425) and the web UI (3430). The web UI is reached only
+    # through Caddy (the web or caddy service below), which asks for the
+    # password; its port answers the gateway's /v1 routes too, with a key
     command: [web, --addr, "0.0.0.0:3430", --no-open]
     environment:
       MAGPIE_WEB_KEY: ${MAGPIE_WEB_KEY:?set MAGPIE_WEB_KEY in .env}
       MAGPIE_PLUGIN_STREAMS: ${MAGPIE_PLUGIN_STREAMS:-2048}
       MAGPIE_PUBLIC_URL: ${MAGPIE_PUBLIC_URL:-}
       MAGPIE_WEB_URL: ${MAGPIE_WEB_URL:-}
-      MAGPIE_ALLOW_IPS: ${MAGPIE_ALLOW_IPS:-}
+      # with a list, Caddy's own address is on it: magpie sees Caddy's
+      # address, and Caddy checks the client's against the list itself
+      MAGPIE_ALLOW_IPS: ${MAGPIE_ALLOW_IPS:+${MAGPIE_ALLOW_IPS},${MAGPIE_CADDY_IP:-172.29.250.10}}
       TZ: ${TZ:-Asia/Shanghai}
     ports:
       - "${MAGPIE_BIND:-127.0.0.1}:${MAGPIE_GATEWAY_PORT:-3425}:3425"
-      # the web UI holds magpie's admin key: on this host only unless --web-bind
-      - "${MAGPIE_WEB_BIND:-127.0.0.1}:${MAGPIE_WEB_PORT:-3430}:3430"
+    networks: [gw]
     volumes:
       - ./config:/config
 
-  # HTTPS in front of magpie, with a certificate from Let's Encrypt; on
-  # when .env has COMPOSE_PROFILES=https (install --domain)
+  # the web UI on plain HTTP (no domain): Caddy asks for the password and
+  # signs the browser in to magpie; on when COMPOSE_PROFILES=web
+  web:
+    <<: *limits
+    image: ${CADDY_IMAGE:-caddy:2}
+    container_name: magpie-web
+    profiles: [web]
+    restart: unless-stopped
+    depends_on:
+      magpie:
+        condition: service_healthy
+    environment:
+      MAGPIE_WEB_KEY: ${MAGPIE_WEB_KEY:?set MAGPIE_WEB_KEY in .env}
+    ports:
+      - "${MAGPIE_WEB_BIND:-0.0.0.0}:${MAGPIE_WEB_PORT:-3430}:3430"
+    networks:
+      gw:
+        ipv4_address: ${MAGPIE_CADDY_IP:-172.29.250.10}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/data:/data
+      - ./caddy/config:/config
+
+  # HTTPS in front of magpie, with a certificate from Let's Encrypt, and the
+  # same password for the web UI; on when COMPOSE_PROFILES=https (--domain)
   caddy:
     <<: *limits
     image: ${CADDY_IMAGE:-caddy:2}
@@ -264,30 +290,140 @@ services:
         condition: service_healthy
     environment:
       MAGPIE_DOMAIN: ${MAGPIE_DOMAIN:-}
+      MAGPIE_WEB_KEY: ${MAGPIE_WEB_KEY:?set MAGPIE_WEB_KEY in .env}
     ports:
       - "80:80"
       - "443:443"
       - "443:443/udp"
+    networks:
+      gw:
+        ipv4_address: ${MAGPIE_CADDY_IP:-172.29.250.10}
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./caddy/data:/data
       - ./caddy/config:/config
+
+# a network of its own with a fixed range, so Caddy's address (the one
+# magpie's allow list lets in) is known before anything starts
+networks:
+  gw:
+    name: magpie_gw
+    ipam:
+      config:
+        - subnet: ${MAGPIE_SUBNET:-172.29.250.0/24}
 EOF
 }
 
+# The gateway's client routes, which magpie's web port hands to the gateway
+# (clientPrefixes in internal/gateway/oneport.go; TestForkCaddyClientPaths in
+# internal/gateway holds the two together). Each brings a gateway key, so Caddy passes
+# them on without the password, as magpie's own port would answer them.
+CLIENT_PATHS="/v1 /v1beta /models /chat/completions /responses /messages /images /embeddings /rerank /decisions /audio /videos /realtime /muse-code/models /backend-api/codex /alpha/search /mcp /me /deepseek-chat /join /magpie-ca.crt"
+
+# caddy_hash prints the bcrypt hash of the password on stdin, made by Caddy itself
+caddy_hash() {
+	docker run --rm -i "$(caddy_image)" caddy hash-password 2>/dev/null | tail -n 1
+}
+
+caddy_image() {
+	local v
+	v=$(env_get CADDY_IMAGE)
+	printf '%s' "${v:-caddy:2}"
+}
+
+# write_caddyfile FILE HASH writes Caddy's file for what .env says: the web
+# UI behind a password (basic auth, user MAGPIE_WEB_USER, HASH the bcrypt of
+# MAGPIE_WEB_PASSWORD), on plain HTTP port 3430 without a domain, on HTTPS
+# with one. Past the password, Caddy hands magpie the browser's sign-in
+# cookie (the web key) itself, so the password is the only sign-in.
 write_caddyfile() {
-	cat >"$1" <<'EOF'
-# Written by magpie.sh install. Caddy gets and renews the certificate for
-# MAGPIE_DOMAIN by itself (ports 80 and 443 must reach this host), and adds
-# X-Forwarded-For, so magpie answers every request it passes on as one from
-# another machine: a gateway key is needed.
-{$MAGPIE_DOMAIN} {
-	reverse_proxy magpie:3430 {
-		# streams (SSE) go out as they come
-		flush_interval -1
+	local file=$1 hash=$2 user allow site paths='' p gw_ip
+	user=$(env_get MAGPIE_WEB_USER)
+	allow=$(env_get MAGPIE_ALLOW_IPS)
+	for p in $CLIENT_PATHS; do paths+=" $p $p/*"; done
+	if [ -n "$(env_get MAGPIE_DOMAIN)" ]; then
+		site='{$MAGPIE_DOMAIN}'
+	else
+		site='http://:3430'
+	fi
+	{
+		cat <<'EOF'
+# Written by magpie.sh, again on each `magpiectl install` and
+# `magpiectl password` (the one before is kept as Caddyfile.bak).
+#
+# Gateway clients pass on as they came: magpie checks their gateway key.
+# Everything else is the web UI: it takes the password first, and then
+# Caddy signs the browser in to magpie with the web key, which it adds as
+# magpie's own sign-in cookie.
+{
+	admin off
+}
+
+EOF
+		printf '%s {\n\troute {\n' "$site"
+		if [ -n "$allow" ]; then
+			# the host itself comes in from the network's gateway address
+			gw_ip=$(subnet_host "$(env_get MAGPIE_SUBNET)" 1)
+			printf '\t\t# MAGPIE_ALLOW_IPS: magpie sees only Caddy, so the list is checked here\n'
+			printf '\t\t@outside not remote_ip %s %s\n' "$(printf '%s' "$allow" | tr ',' ' ' | tr -s ' ')" "$gw_ip"
+			printf '\t\trespond @outside "not on this magpie'\''s allow list (MAGPIE_ALLOW_IPS)" 403\n\n'
+		fi
+		printf '\t\t@client path%s\n' "$paths"
+		cat <<'EOF'
+		handle @client {
+			reverse_proxy magpie:3430 {
+				# streams (SSE) go out as they come
+				flush_interval -1
+			}
+		}
+		# a plugin page's files: a sandboxed frame sends no password, and
+		# magpie serves them only with the token its signed-in page hands out
+		handle /_magpie/plugin/* {
+			reverse_proxy magpie:3430 {
+				flush_interval -1
+			}
+		}
+		handle {
+			basic_auth {
+EOF
+		printf '\t\t\t\t%s %s\n' "$user" "$hash"
+		cat <<'EOF'
+			}
+			reverse_proxy magpie:3430 {
+				flush_interval -1
+				header_up -Authorization
+				header_up Cookie "magpie_web_3430={$MAGPIE_WEB_KEY}; {http.request.header.Cookie}"
+			}
+		}
 	}
 }
 EOF
+	} >"$file"
+	chmod 600 "$file"
+}
+
+# subnet_host 172.29.250.0/24 N prints 172.29.250.N
+subnet_host() {
+	local base=${1%/*}
+	printf '%s.%s' "${base%.*}" "$2"
+}
+
+# web_caddy prints the Caddy container this install runs: magpie-caddy with
+# a domain, else magpie-web
+web_caddy() {
+	if [ -n "$(env_get MAGPIE_DOMAIN)" ]; then echo magpie-caddy; else echo magpie-web; fi
+}
+
+# caddy_config writes the Caddyfile with a fresh hash of the password; in a
+# dry run, with a stand-in for the hash
+caddy_config() {
+	local hash='<bcrypt of MAGPIE_WEB_PASSWORD>'
+	if [ "$DRY_RUN" = 0 ]; then
+		hash=$(printf '%s\n' "$(env_get MAGPIE_WEB_PASSWORD)" | caddy_hash)
+		[[ $hash == \$2* ]] || die "Caddy didn't hash the web UI's password (docker run $(caddy_image) caddy hash-password)"
+	fi
+	[ -f "$DIR/caddy/Caddyfile" ] && cp -f "$DIR/caddy/Caddyfile" "$DIR/caddy/Caddyfile.bak"
+	write_caddyfile "$DIR/caddy/Caddyfile" "$hash"
 }
 
 # ---------------------------------------------------------------- commands
@@ -299,7 +435,8 @@ magpie.sh — one-command Docker deployment of this fork's magpie gateway.
   sudo bash magpie.sh install --public IP  first install (plain HTTP on IP), or again to change options
   sudo magpiectl upgrade [--tag T]        pull a new image and switch to it, back on failure
   sudo magpiectl rollback [--restore F]   back to the image before the last upgrade
-  magpiectl status | logs [svc] | url     look at it
+  magpiectl status | logs [svc] | url     look at it (url: the addresses and the web UI's password)
+  sudo magpiectl password [NEW]           a new password for the web UI (random when none is given)
   sudo magpiectl backup                   a backup of the data folder
   sudo magpiectl key add <name>           a gateway key for a client
   sudo magpiectl restart                  restart magpie
@@ -310,19 +447,25 @@ EOF
 	cat <<EOF
 install options:
   --public IP         serve the gateway to other machines on this host's IP, over
-                      plain HTTP (http://IP:3425); the web UI stays on this host
+                      plain HTTP (http://IP:3425); the web UI is at http://IP:3430
   --dir DIR           where it all lives (default $DEFAULT_DIR)
   --image IMAGE       the image, without a tag (default $DEFAULT_IMAGE)
   --tag TAG           the image tag (default latest)
   --bind ADDR         the host address the gateway's port is published on
                       (default 127.0.0.1; 0.0.0.0 for every interface)
-  --web-bind ADDR     the same for the web UI's port (default 127.0.0.1: reach
-                      it through ssh -L); 0.0.0.0 sends its admin key in the clear
+  --web-bind ADDR     the same for the web UI's port (default 0.0.0.0, behind
+                      a password; 127.0.0.1 keeps it on this host, for ssh -L)
   --gateway-port N    the host port for the gateway (default 3425)
   --web-port N        the host port for the web UI (default 3430)
   --streams N         MAGPIE_PLUGIN_STREAMS, plugin fetches at once (default 2048)
   --public-url URL    MAGPIE_PUBLIC_URL, the gateway's address for others
-  --allow-ips LIST    MAGPIE_ALLOW_IPS: only these addresses may call magpie (off: any)
+  --allow-ips LIST    MAGPIE_ALLOW_IPS: only these addresses may reach magpie,
+                      the gateway and the web UI, with a domain too (off: any)
+  --web-user NAME     the web UI's user name (default admin)
+  --web-password PW   the web UI's password (default: a random one, made once;
+                      magpiectl url shows it)
+  --subnet CIDR       the Docker network's range (default 172.29.250.0/24);
+                      change it only when it clashes with another network
   --tz ZONE           the container's time zone (default Asia/Shanghai)
   --domain NAME       optional: HTTPS on NAME through Caddy (ports 80 and 443)
   --no-domain         stop serving HTTPS through Caddy
@@ -372,10 +515,12 @@ registry_login() {
 check_ports() {
 	command -v ss >/dev/null 2>&1 || return 0
 	local p ports=() mine
-	ports+=("$(env_get MAGPIE_GATEWAY_PORT)" "$(env_get MAGPIE_WEB_PORT)")
-	[ "${ports[0]}" ] || ports[0]=3425
-	[ "${ports[1]}" ] || ports[1]=3430
-	[ -n "$(env_get MAGPIE_DOMAIN)" ] && ports+=(80 443)
+	ports+=("$(env_get_at "$ENV_FILE" MAGPIE_GATEWAY_PORT 3425)")
+	if [ -n "$(env_get MAGPIE_DOMAIN)" ]; then
+		ports+=(80 443)
+	else
+		ports+=("$(env_get_at "$ENV_FILE" MAGPIE_WEB_PORT 3430)")
+	fi
 	mine=$(docker ps -q --filter name='^magpie' 2>/dev/null || true)
 	[ -n "$mine" ] && return 0 # re-run: the ports are its own
 	for p in "${ports[@]}"; do
@@ -387,6 +532,7 @@ check_ports() {
 
 cmd_install() {
 	local tag='' domain='' no_domain=0 bind='' web_bind='' public_ip='' gw_port='' web_port='' streams='' public_url='' allow_ips='' tz='' tune=1 image=''
+	local web_user='' web_password='' subnet=''
 	DIR=${MAGPIE_DIR:-$DEFAULT_DIR}
 	INSTALL_DOCKER=0
 	while [ $# -gt 0 ]; do
@@ -404,6 +550,9 @@ cmd_install() {
 		--streams) streams=${2:?}; shift ;;
 		--public-url) public_url=${2:?}; shift ;;
 		--allow-ips) allow_ips=${2:?}; shift ;;
+		--web-user) web_user=${2:?}; shift ;;
+		--web-password) web_password=${2:?}; shift ;;
+		--subnet) subnet=${2:?}; shift ;;
 		--tz) tz=${2:?}; shift ;;
 		--no-tune) tune=0 ;;
 		--install-docker) INSTALL_DOCKER=1 ;;
@@ -422,6 +571,9 @@ cmd_install() {
 	for p in "$gw_port" "$web_port" "$streams"; do
 		[ -z "$p" ] || [[ $p =~ ^[0-9]+$ ]] || die "not a number: $p"
 	done
+	[ -z "$web_user" ] || [[ $web_user =~ ^[A-Za-z0-9._-]+$ ]] || die "--web-user takes letters, digits and . _ - only"
+	[ -z "$web_password" ] || [[ $web_password != *[[:space:]]* ]] || die "--web-password can't hold a space"
+	[ -z "$subnet" ] || [[ $subnet =~ ^([0-9]{1,3}\.){3}0/(1[6-9]|2[0-4])$ ]] || die "--subnet takes an IPv4 range like 172.29.250.0/24 (a /16 to a /24)"
 	if [ -n "$public_ip" ]; then
 		[ -z "$domain" ] || die "--public is plain HTTP on an IP; --domain is HTTPS on a name: give one of them"
 		[[ $public_ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || $public_ip == *:* ]] || die "--public takes this host's IP address, not $public_ip"
@@ -432,20 +584,6 @@ cmd_install() {
 		public_url=${public_url:-http://$shown:${gw_port:-$(env_get_at "$DIR/.env" MAGPIE_GATEWAY_PORT 3425)}}
 	fi
 	ENV_FILE=$DIR/.env
-
-	# Behind Caddy magpie sees Caddy's address, so an allow list there, set
-	# now or kept from a --public install, would shut every client out.
-	# Checked before .env is touched: what this run asks for, else what it keeps.
-	local will_domain=$domain will_allow=$allow_ips
-	[ -n "$will_domain" ] || [ "$no_domain" = 1 ] || will_domain=$(env_get MAGPIE_DOMAIN)
-	[ -n "$will_allow" ] || will_allow=$(env_get MAGPIE_ALLOW_IPS)
-	[ "$will_allow" = off ] && will_allow=''
-	if [ -n "$will_domain" ] && [ -n "$will_allow" ]; then
-		if [ -n "$allow_ips" ]; then
-			die "--allow-ips with --domain would shut everyone out: behind Caddy, magpie sees Caddy's address, not the client's. Limit addresses in caddy/Caddyfile instead (docs/fork/deploy-docker.md)"
-		fi
-		die "this install has an allow list ($will_allow), which behind Caddy would shut everyone out: magpie sees Caddy's address, not the client's. Add --allow-ips off (and limit addresses in caddy/Caddyfile if you need to, docs/fork/deploy-docker.md)"
-	fi
 
 	step "magpie gateway → $DIR"
 	[ "$DRY_RUN" = 1 ] || ensure_docker
@@ -474,6 +612,23 @@ cmd_install() {
 	[ -n "$(env_get MAGPIE_PLUGIN_STREAMS)" ] || env_set MAGPIE_PLUGIN_STREAMS 2048
 	[ -n "$gw_port" ] && env_set MAGPIE_GATEWAY_PORT "$gw_port"
 	[ -n "$web_port" ] && env_set MAGPIE_WEB_PORT "$web_port"
+	# an install from before the password kept the web UI on this host by
+	# default (127.0.0.1, written into .env); it now has a password, and
+	# opens to the network unless --web-bind 127.0.0.1 says otherwise
+	if [ -f "$ENV_FILE" ] && [ -z "$(env_get MAGPIE_WEB_USER)" ] && [ -z "$web_bind" ] && [ "$(env_get MAGPIE_WEB_BIND)" = 127.0.0.1 ]; then
+		web_bind=0.0.0.0
+		ok "the web UI now asks for a password and opens to the network (--web-bind 127.0.0.1 keeps it on this host)"
+	fi
+	[ -n "$web_user" ] && env_set MAGPIE_WEB_USER "$web_user"
+	[ -n "$(env_get MAGPIE_WEB_USER)" ] || env_set MAGPIE_WEB_USER admin
+	[ -n "$web_password" ] && env_set MAGPIE_WEB_PASSWORD "$web_password"
+	[ -n "$(env_get MAGPIE_WEB_PASSWORD)" ] || env_set MAGPIE_WEB_PASSWORD "$(random_key | cut -c1-20)"
+	if [ -n "$subnet" ]; then
+		env_set MAGPIE_SUBNET "$subnet"
+		env_set MAGPIE_CADDY_IP "$(subnet_host "$subnet" 10)"
+	fi
+	[ -n "$(env_get MAGPIE_SUBNET)" ] || env_set MAGPIE_SUBNET 172.29.250.0/24
+	[ -n "$(env_get MAGPIE_CADDY_IP)" ] || env_set MAGPIE_CADDY_IP "$(subnet_host "$(env_get MAGPIE_SUBNET)" 10)"
 	[ -n "$tz" ] && env_set TZ "$tz"
 	[ -n "$(env_get TZ)" ] || env_set TZ Asia/Shanghai
 	if [ "$allow_ips" = off ]; then
@@ -492,31 +647,28 @@ cmd_install() {
 	elif [ -n "$public_url" ]; then
 		env_set MAGPIE_PUBLIC_URL "$public_url"
 	fi
-	# Caddy runs while a domain is set; behind it magpie's own ports stay on this host
+	# Caddy is in front of the web UI: on HTTPS (80, 443) with a domain, and
+	# then magpie's gateway port stays on this host; else on plain HTTP
 	if [ -n "$(env_get MAGPIE_DOMAIN)" ]; then
 		env_set COMPOSE_PROFILES https
 		bind=127.0.0.1
-		web_bind=127.0.0.1
 	else
-		env_set COMPOSE_PROFILES ""
+		env_set COMPOSE_PROFILES web
 	fi
 	[ -n "$bind" ] && env_set MAGPIE_BIND "$bind"
 	[ -n "$(env_get MAGPIE_BIND)" ] || env_set MAGPIE_BIND 127.0.0.1
 	[ -n "$web_bind" ] && env_set MAGPIE_WEB_BIND "$web_bind"
-	[ -n "$(env_get MAGPIE_WEB_BIND)" ] || env_set MAGPIE_WEB_BIND 127.0.0.1
-	if [ "$(env_get MAGPIE_WEB_BIND)" != 127.0.0.1 ] && [ -z "$(env_get MAGPIE_DOMAIN)" ]; then
-		warn "the web UI is published on $(env_get MAGPIE_WEB_BIND) over plain HTTP: its link carries magpie's admin key in the clear. Without --web-bind it stays on this host (ssh -L)"
+	[ -n "$(env_get MAGPIE_WEB_BIND)" ] || env_set MAGPIE_WEB_BIND 0.0.0.0
+	if [ -z "$(env_get MAGPIE_DOMAIN)" ] && [ "$(env_get MAGPIE_WEB_BIND)" != 127.0.0.1 ]; then
+		warn "the web UI is open on port $(env_get_at "$ENV_FILE" MAGPIE_WEB_PORT 3430) over plain HTTP: its password crosses the network unencrypted. Open the port to your own address only (security group), or use --domain for HTTPS"
 	fi
 
 	# compose.yaml and the Caddyfile are this script's; an older one is kept as .bak
-	local f
-	for f in compose.yaml caddy/Caddyfile; do
-		[ -f "$DIR/$f" ] && cp -f "$DIR/$f" "$DIR/$f.bak"
-	done
+	[ -f "$DIR/compose.yaml" ] && cp -f "$DIR/compose.yaml" "$DIR/compose.yaml.bak"
 	write_compose "$DIR/compose.yaml"
-	write_caddyfile "$DIR/caddy/Caddyfile"
 
 	if [ "$DRY_RUN" = 1 ]; then
+		caddy_config
 		step "dry run: wrote $DIR/compose.yaml, $DIR/caddy/Caddyfile and $DIR/.env; the host's settings would be:"
 		tune_host
 		return 0
@@ -548,20 +700,28 @@ cmd_install() {
 	digest=$(image_digest "$ref")
 	[ -n "$digest" ] && env_set MAGPIE_IMAGE_REF "$digest"
 
+	# the password's hash is made by the Caddy image just pulled
+	caddy_config
+
 	step "Starting"
-	# a profile turned off leaves its container running: Caddy goes by hand
-	if [ -z "$(env_get MAGPIE_DOMAIN)" ] && docker container inspect magpie-caddy >/dev/null 2>&1; then
-		docker rm -f magpie-caddy >/dev/null
-		ok "stopped Caddy (no domain)"
-	fi
+	# a profile turned off leaves its container running: the other Caddy goes by hand
+	local c
+	for c in magpie-caddy magpie-web; do
+		if [ "$c" != "$(web_caddy)" ] && docker container inspect "$c" >/dev/null 2>&1; then
+			docker rm -f "$c" >/dev/null
+			ok "removed $c (not used with this install's settings)"
+		fi
+	done
 	compose up -d --remove-orphans
+	# a running Caddy reads its file again only when it restarts
+	docker restart "$(web_caddy)" >/dev/null
 	if ! wait_healthy; then
 		compose logs --tail 80 magpie >&2 || true
 		die "magpie didn't become healthy within ${HEALTH_WAIT}s (its log is above)"
 	fi
 	ok "magpie is up: $(running_version)"
 	if [ -n "$(env_get MAGPIE_DOMAIN)" ]; then
-		say "${c_dim}  Caddy gets the certificate for $(env_get MAGPIE_DOMAIN) on first use; \`magpie logs caddy\` says how it went${c_off}"
+		say "${c_dim}  Caddy gets the certificate for $(env_get MAGPIE_DOMAIN) on first use; \`magpiectl logs caddy\` says how it went${c_off}"
 	fi
 	say
 	cmd_url
@@ -571,27 +731,29 @@ cmd_install() {
 }
 
 cmd_url() {
-	local key bind web_bind port gp domain public
-	key=$(env_get MAGPIE_WEB_KEY)
+	local bind web_bind port gp domain public host
 	bind=$(env_get MAGPIE_BIND)
 	web_bind=$(env_get MAGPIE_WEB_BIND)
-	web_bind=${web_bind:-127.0.0.1}
-	port=$(env_get MAGPIE_WEB_PORT)
-	port=${port:-3430}
-	gp=$(env_get MAGPIE_GATEWAY_PORT)
-	gp=${gp:-3425}
+	port=$(env_get_at "$ENV_FILE" MAGPIE_WEB_PORT 3430)
+	gp=$(env_get_at "$ENV_FILE" MAGPIE_GATEWAY_PORT 3425)
 	domain=$(env_get MAGPIE_DOMAIN)
 	public=$(env_get MAGPIE_PUBLIC_URL)
+	# the host other machines reach: MAGPIE_PUBLIC_URL's (--public IP)
+	host=${public#*://}
+	host=${host%%/*}
+	host=${host%:*}
+	[ -n "$host" ] && [ -z "$domain" ] || host='<this host>'
 	say "${c_bold}Web UI${c_off}"
 	if [ -n "$domain" ]; then
-		say "  https://$domain/?k=$key"
-	fi
-	if [ "$web_bind" = 127.0.0.1 ]; then
-		say "  http://127.0.0.1:$port/?k=$key"
-		say "  ${c_dim}on this host only. From your computer: ssh -L $port:127.0.0.1:$port <user>@<this host>, then open the link above${c_off}"
+		say "  https://$domain/"
+	elif [ "$web_bind" = 127.0.0.1 ]; then
+		say "  http://127.0.0.1:$port/"
+		say "  ${c_dim}on this host only (--web-bind 127.0.0.1). From your computer: ssh -L $port:127.0.0.1:$port <user>@<this host>, then open it${c_off}"
 	else
-		say "  http://<this host>:$port/?k=$key"
+		say "  http://$host:$port/"
 	fi
+	say "  user:     $(env_get MAGPIE_WEB_USER)"
+	say "  password: $(env_get MAGPIE_WEB_PASSWORD)    ${c_dim}(sudo magpiectl password changes it)${c_off}"
 	say "${c_bold}Gateway${c_off} (every client sends a gateway key: sudo magpiectl key add <name>)"
 	if [ -n "$domain" ]; then
 		say "  OpenAI: https://$domain/v1    Anthropic / Gemini: https://$domain"
@@ -602,7 +764,27 @@ cmd_url() {
 	else
 		say "  OpenAI: http://<this host>:$gp/v1    Anthropic / Gemini: http://<this host>:$gp"
 	fi
-	say "${c_dim}The web link carries magpie's admin key; anyone with it can change magpie. Keep it to yourself.${c_off}"
+	say "${c_dim}Anyone with the web UI's password can change magpie. Keep it to yourself.${c_off}"
+}
+
+# cmd_password [NEW] sets the web UI's password (a new random one when none
+# is given) and has Caddy take it
+cmd_password() {
+	need_root password
+	load_install
+	local pw=${1:-}
+	if [ -z "$pw" ] && [ -t 0 ]; then
+		read -r -s -p "New password for the web UI (empty: a random one): " pw
+		say
+	fi
+	[ -n "$pw" ] || pw=$(random_key | cut -c1-20)
+	[[ $pw != *[[:space:]]* ]] || die "a password can't hold a space"
+	env_set MAGPIE_WEB_PASSWORD "$pw"
+	caddy_config
+	docker restart "$(web_caddy)" >/dev/null
+	ok "the web UI's password is changed; a browser signed in with the old one asks again"
+	say "  user:     $(env_get MAGPIE_WEB_USER)"
+	say "  password: $pw"
 }
 
 # backup_config [label] writes backups/config-<time>[-label].tar.gz, without
@@ -760,7 +942,7 @@ cmd_self_update() {
 	fi
 	install -m 0755 "$tmp" "$DIR/magpie.sh"
 	rm -f "$tmp"
-	ok "updated $DIR/magpie.sh ($(grep -m1 '^SCRIPT_VERSION=' "$DIR/magpie.sh" | cut -d= -f2)); run \`sudo magpie install\` to apply a new compose.yaml"
+	ok "updated $DIR/magpie.sh ($(grep -m1 '^SCRIPT_VERSION=' "$DIR/magpie.sh" | cut -d= -f2)); run \`sudo magpiectl install\` to apply a new compose.yaml"
 }
 
 main() {
@@ -779,6 +961,7 @@ main() {
 		load_install
 		cmd_url
 		;;
+	password) cmd_password "$@" ;;
 	version)
 		load_install
 		say "$(running_version)  (script $SCRIPT_VERSION)"

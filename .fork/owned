@@ -22,3 +22,6 @@ deploy
 # the plugin host's raised stream limit
 internal/plugin/stream_limit_fork.go
 internal/plugin/stream_limit_fork_test.go
+
+# the test that holds magpie.sh's Caddy paths to the gateway's client routes
+internal/gateway/deploy_caddy_paths_fork_test.go
