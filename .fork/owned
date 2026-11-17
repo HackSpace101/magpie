@@ -16,6 +16,9 @@
 # the fork's deploy guide
 docs/fork
 
+# the one-command Docker deployment (magpie.sh)
+deploy
+
 # the plugin host's raised stream limit
 internal/plugin/stream_limit_fork.go
 internal/plugin/stream_limit_fork_test.go
