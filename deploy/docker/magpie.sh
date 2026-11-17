@@ -1011,7 +1011,10 @@ cmd_status() {
 	say "streams:  $(docker exec magpie printenv MAGPIE_PLUGIN_STREAMS 2>/dev/null || echo '?') plugin fetches at once"
 	say "open files in the container: $(docker exec magpie sh -c 'ulimit -n' 2>/dev/null || echo '?')"
 	say "data:     $DIR/config ($(du -sh "$DIR/config" 2>/dev/null | cut -f1))"
-	say "backups:  $(ls -1 "$DIR"/backups/config-*.tar.gz 2>/dev/null | wc -l) in $DIR/backups"
+	# counted without ls, which fails when there is none yet (pipefail)
+	local backups=("$DIR"/backups/config-*.tar.gz)
+	[ -e "${backups[0]}" ] || backups=()
+	say "backups:  ${#backups[@]} in $DIR/backups"
 }
 
 cmd_self_update() {
