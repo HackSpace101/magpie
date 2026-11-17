@@ -415,15 +415,21 @@ sudo sysctl --system
 
 现在不需要，可以跳过。有了域名以后：
 
-1. 域名的 A 记录指向服务器，安全组放行 80 和 443；
-2. 执行：
+1. 给一个子域名（如 `gw.example.com`）加 A 记录，指向服务器 IP。用 Cloudflare 的话要设成 **仅 DNS（灰色云朵）**：它的代理会切断长时间的流式回复（免费版 100 秒），还会让 Caddy 签不下证书；
+2. 安全组放行 TCP 80 和 443（UDP 443 可选，用于 HTTP/3）。80 用来签证书，不能关；
+3. 等 `dig +short gw.example.com` 返回服务器 IP 以后再执行：
    ```bash
    sudo magpiectl install --domain gw.example.com
+   # 之前用 --public 设过 --allow-ips 的话，要一并去掉，否则脚本会拒绝：
+   sudo magpiectl install --domain gw.example.com --allow-ips off
    ```
+4. `magpiectl logs caddy` 里看到 `certificate obtained successfully` 就好了。之后 3425 端口可以从安全组里关掉。
+
+服务器在中国大陆的话，域名要先备案，否则云厂商会拦截 80/443 的访问。
 
 脚本会启动一个 Caddy 容器，自动申请和续期 Let's Encrypt 证书。之后网关是 `https://gw.example.com/v1`，Web 界面是 `https://gw.example.com/?k=...`，magpie 自己的端口会改回只在本机监听。
 
-注意：用域名时 magpie 看到的是 Caddy 的地址，所以不能用 `--allow-ips`（脚本会拒绝），要在 `/opt/magpie/caddy/Caddyfile` 里限制：
+注意：用域名时 magpie 看到的是 Caddy 的地址，所以不能用 `--allow-ips`（脚本会拒绝，`--public` 时留下的也一样），要在 `/opt/magpie/caddy/Caddyfile` 里限制：
 
 ```
 {$MAGPIE_DOMAIN} {

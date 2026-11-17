@@ -422,9 +422,6 @@ cmd_install() {
 	for p in "$gw_port" "$web_port" "$streams"; do
 		[ -z "$p" ] || [[ $p =~ ^[0-9]+$ ]] || die "not a number: $p"
 	done
-	if [ -n "$domain" ] && [ -n "$allow_ips" ] && [ "$allow_ips" != off ]; then
-		die "--allow-ips with --domain would shut everyone out: behind Caddy, magpie sees Caddy's address, not the client's. Limit addresses in caddy/Caddyfile instead (docs/fork/deploy-docker.md)"
-	fi
 	if [ -n "$public_ip" ]; then
 		[ -z "$domain" ] || die "--public is plain HTTP on an IP; --domain is HTTPS on a name: give one of them"
 		[[ $public_ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || $public_ip == *:* ]] || die "--public takes this host's IP address, not $public_ip"
@@ -435,6 +432,20 @@ cmd_install() {
 		public_url=${public_url:-http://$shown:${gw_port:-$(env_get_at "$DIR/.env" MAGPIE_GATEWAY_PORT 3425)}}
 	fi
 	ENV_FILE=$DIR/.env
+
+	# Behind Caddy magpie sees Caddy's address, so an allow list there, set
+	# now or kept from a --public install, would shut every client out.
+	# Checked before .env is touched: what this run asks for, else what it keeps.
+	local will_domain=$domain will_allow=$allow_ips
+	[ -n "$will_domain" ] || [ "$no_domain" = 1 ] || will_domain=$(env_get MAGPIE_DOMAIN)
+	[ -n "$will_allow" ] || will_allow=$(env_get MAGPIE_ALLOW_IPS)
+	[ "$will_allow" = off ] && will_allow=''
+	if [ -n "$will_domain" ] && [ -n "$will_allow" ]; then
+		if [ -n "$allow_ips" ]; then
+			die "--allow-ips with --domain would shut everyone out: behind Caddy, magpie sees Caddy's address, not the client's. Limit addresses in caddy/Caddyfile instead (docs/fork/deploy-docker.md)"
+		fi
+		die "this install has an allow list ($will_allow), which behind Caddy would shut everyone out: magpie sees Caddy's address, not the client's. Add --allow-ips off (and limit addresses in caddy/Caddyfile if you need to, docs/fork/deploy-docker.md)"
+	fi
 
 	step "magpie gateway → $DIR"
 	[ "$DRY_RUN" = 1 ] || ensure_docker
