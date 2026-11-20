@@ -108,10 +108,15 @@ func noRests() {
 	restingUntil.m = map[string]time.Time{}
 	restingUntil.note = map[string]Rest{}
 	restingUntil.lifted = map[string]time.Time{}
+	restingUntil.renewAsked = nil
 	restingUntil.Unlock()
 	codexHolds.Lock()
 	codexHolds.m = nil
 	codexHolds.Unlock()
+	limitNotices.Lock()
+	limitNotices.m = map[string]LimitNotice{}
+	limitNotices.Unlock()
+	noticesDropped.Store(false)
 }
 
 func post(t *testing.T, path, body string) (int, string) {
