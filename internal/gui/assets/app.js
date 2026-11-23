@@ -288,7 +288,7 @@ function svg(d, size = 12, stroke = 1.6) {
   s.innerHTML = `<path d="${d}" fill="none" stroke="currentColor" stroke-width="${stroke}" stroke-linecap="round" stroke-linejoin="round"/>`;
   return s;
 }
-const CHEV = "m5.5 6.5 2.5 2.5 2.5-2.5";
+const CHEV = "m5.5 6.8 2.5 2.5 2.5-2.5";
 // three dots, a row's actions (drawn with a thick round stroke)
 const DOTS = "M3.5 8h.01M8 8h.01M12.5 8h.01";
 const CHEV_R = "m6.5 4.5 3 3.5-3 3.5";
@@ -12614,7 +12614,7 @@ function renderRouting(p) {
     // in turn and by weight go round already
     kLabel.hidden = kWrap.hidden = routingNow() === "rotate" || routingNow() === "weight";
     // each key's or account's weight shows beside it while by weight
-    for (const l of document.querySelectorAll(".accts")) if (l.dataset.provider === p.id) l.classList.toggle("weighted", routingNow() === "weight");
+    for (const l of document.querySelectorAll(".accts")) if (l.dataset.provider === p.id) l.classList.toggle("weighted", routingNow() === "weight"), l.onrouting?.();
   };
   const rPick = routingSegs(routingsOf(p).map(([id, name, , js]) => [id, ROUTINGS.some((r) => r[0] === id) ? t(name) : name, , js]), routingNow(), (routing) => { draft.routing = routing; drawRouting(); });
   const rRow = el("div", "route-pick");
@@ -13848,6 +13848,10 @@ function renderAccounts(a, p) {
     } else if (l.active) {
       const using = el("span", "using", l.paused ? t("Paused") : back ? t("First for now") : several ? t("First") : t("In use"));
       if (back && !l.paused) using.title = t("{user} was nearly used up, so magpie signed {agent} in to this one; it goes back to {user} once that has room again", { user: back.user, agent: a.agentName });
+      // By weight it is only the one signed in to: the weights share the
+      // conversations out, not the order (Wing8Aqua on X read First as the
+      // account used most); drawRouting tells it the routing picked now
+      else if (several && !l.paused) (list.onrouting = () => { const w = list.matches(".weighted"); using.textContent = t(w ? "Signed in" : "First"); w ? using.title = t("By weight, each new conversation goes to an account by its weight and stays there") : using.removeAttribute("title"); })();
       line.append(using);
       if (a.agent === "qoder" || a.agent === "qoder-cn" || l.own) {
         line.append(forgetOf(l.own));
