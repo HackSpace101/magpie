@@ -1267,6 +1267,9 @@ func (s *Server) routes() *routeMux {
 	mux.HandleFunc("GET "+ArtifactPagePath+"{ref}/"+artifactAPIDir+"events", s.artifactEvents)
 	mux.HandleFunc("POST "+ArtifactPagePath+"{ref}/"+artifactAPIDir+"publish", s.artifactPublish)
 	mux.HandleFunc("POST "+ArtifactPagePath+"{ref}/"+artifactAPIDir+"meta", s.artifactMeta)
+	mux.HandleFunc("POST "+ArtifactPagePath+"{ref}/"+artifactAPIDir+"upload", s.artifactUpload)
+	mux.HandleFunc("POST "+ArtifactPagePath+"{ref}/"+artifactAPIDir+"assets", s.artifactAssets)
+	mux.HandleFunc("GET "+artifactBlobPath+"{id}", s.artifactBlob)
 	mux.HandleFunc(ImageMCPPath, s.imageMCP)
 	mux.HandleFunc(BrowserMCPPath, s.browserMCP)
 	mux.HandleFunc("GET "+BrowserExtensionPath, s.browserExtension)
@@ -2309,6 +2312,9 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
 		id = sid
 	}
 	pick := desktopSubagentPick(r, agentOf(r), named, id, body)
+	if pick == nil {
+		pick, _ = claudeSubagentPick(r, agentOf(r), named, id, body)
+	}
 	if pick.Moved() {
 		id = pick.To
 	}
@@ -3003,10 +3009,21 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	if subagent == nil {
 		subagent = s.codexSubagentPick(r, agent, call.Kind, call.Model, body, false)
 	}
-	var desktopPick *SubagentPick
+	var desktopPick, claudePick *SubagentPick
 	if subagent == nil {
 		desktopPick = desktopSubagentPick(r, agent, call.Model, asked, body)
 		subagent = desktopPick
+	}
+	// Claude Code's Explore and Plan, which inherit the lead's model past
+	// the subagent model set (#7176), on that model and its effort
+	if subagent == nil {
+		var effort string
+		claudePick, effort = claudeSubagentPick(r, agent, call.Model, asked, body)
+		subagent = claudePick
+		if claudePick.Moved() {
+			// the lead's model's effort stays with the lead
+			askedEffort = effort
+		}
 	}
 	if subagent.Moved() {
 		call.Model, asked = subagent.Asked, subagent.To
@@ -3016,7 +3033,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		askedEffort = subagentEffort
 	}
 	// any Claude Code subagent's turn, moved or not, for the Routing page's tag
-	subagentID := subagentTurnOf(r, agent, call.Kind, body, desktopPick != nil || subagentEffort != "")
+	subagentID := subagentTurnOf(r, agent, call.Kind, body, desktopPick != nil || claudePick != nil || subagentEffort != "")
 	if _, held := keyHolds(r); !held {
 		// auto groups off: a bare name several vendors serve, none the
 		// agent's own, goes to none of them (freefcw on X)
@@ -3050,6 +3067,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			return
 		}
 		msg := unknownModel(call.Model, "")
+		if moved != nil && asked != call.Model {
+			// magpie put it on another model (Claude Desktop's moves), and
+			// that one is gone: name it, not the one the client asked for,
+			// which magpie serves (#6719: "magpie knows no model X; did
+			// you mean X?")
+			msg = unknownModel(asked, fmt.Sprintf(" (magpie sent this request for %q there)", call.Model))
+		}
 		if g, ok := provider.DisabledGroup(asked); ok {
 			call.Error = "group switched off"
 			msg = fmt.Sprintf("the routing group %s is switched off in Magpie, so %q is not served; switch it on again on Magpie's Routing page to use it", g.Name, call.Model)
