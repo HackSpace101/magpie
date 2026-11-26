@@ -35,7 +35,7 @@ var Keys = []string{
 	// the menu bar's allowance cards
 	"trayUsages", "trayUsage", "trayUsageEvery", "trayNoLogos", "trayAnthropicMark", "trayNoBird", "trayNoNumber", "trayPace", "trayNoCost", "trayWindows",
 	// usage and alerts
-	"currency", "totalCurrency", "trayCurrency", "chineseUnits", "inUncached", "dayStart", "usageAlert", "balanceAlert", "resetReminder", "turnDoneAlert", "maskAlert",
+	"currency", "totalCurrency", "trayCurrency", "chineseUnits", "inUncached", "dayStart", "timeZone", "usageAlert", "balanceAlert", "resetReminder", "turnDoneAlert", "maskAlert",
 	// network
 	"proxy", "pluginProxy", "updateProxy", "updateSource",
 	// privacy
@@ -45,7 +45,7 @@ var Keys = []string{
 	"codexWarmup", "claudeWarmup", "agyWarmup", "codexWarmAt", "claudeWarmAt", "codexWarmAts", "claudeWarmAts",
 	"workbuddyCheckin", "traeCheckin", "minimaxCheckin", "qoderCheckin", "checkinAt",
 	// models: replies, vision, images, search
-	"replyModel", "noLoopGuard", "claudeLeanPrompt", "claudeNoExtraUsage", "claudeRegionHold", "claudePrintMode", "refusalRetries", "retryAfterCap",
+	"replyModel", "noLoopGuard", "claudeLeanPrompt", "claudeNoExtraUsage", "claudeRegionHold", "claudeWaysOut", "claudePrintMode", "refusalRetries", "retryAfterCap",
 	"vision", "visionEffort", "imageGen", "videoGen", "imageTimeout", "imageResolution", "classifyTimeout",
 	// what every routing group does that says nothing of its own
 	"groupSink", "groupFirstToken", "groupPatience",
@@ -194,6 +194,10 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 	// nor whether updates download by themselves (#2296)
 	if _, sent := fields["noAutoDownload"]; !sent {
 		in.NoAutoDownload = cur.NoAutoDownload
+	}
+	// nor the time zone, saved by its own row (JackyFill on X)
+	if _, sent := fields["timeZone"]; !sent {
+		in.TimeZone = cur.TimeZone
 	}
 	// nor the update channel (ssharpcc on X)
 	if _, sent := fields["updateChannel"]; !sent {
@@ -391,6 +395,8 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 	in.FullContext = cur.FullContext     // set on its own (full-context)
 	in.CompactAt = cur.CompactAt         // and so is the threshold
 	in.AgentCompacts = cur.AgentCompacts // and each agent's own (agent-compact)
+	// and where in its window each compacts (agent-compact-pct)
+	in.AgentCompactPcts = cur.AgentCompactPcts
 	in.AgentContexts = cur.AgentContexts // and the windows each is told (agent-contexts)
 	in.ContextCap = cur.ContextCap       // and the longest window of every model (context-cap)
 	in.ContextCapAll = cur.ContextCapAll // and whether it holds the user's own windows
@@ -433,6 +439,8 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 	in.CodexAutoReset = cur.CodexAutoReset
 	in.CodexAutoResetOnly = cur.CodexAutoResetOnly // and at which of the two times
 	in.CodexResetLead = cur.CodexResetLead         // and how early before one expires (codex-reset-lead)
+	// and which resets, by the days they have left (codex-reset-days)
+	in.CodexResetDaysLeast, in.CodexResetDaysMost = cur.CodexResetDaysLeast, cur.CodexResetDaysMost
 	// and which of them spend their credits, set there too
 	in.CodexNoCredits = cur.CodexNoCredits
 	in.CodexCreditsLast = cur.CodexCreditsLast   // and which only after everything else
