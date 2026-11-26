@@ -1157,6 +1157,12 @@ the `ark-beta-systemone-api: true` header magpie adds on Ark's host, and its
 one decision model `doubao-seed-2-1-lite-260915`. The Coding and Agent
 Plans' paths don't serve it, so it bills as pay as you go.
 
+A Google Gemini provider with an AI Studio key (the `google` preset) decides
+with `google/gemini-decision-1` on Google's Decisions API, on the same keys.
+`/v1/systemone` sends it the state, the questions, and `images` and `audio`,
+each a list of data: URLs or URLs. A decision model that can't take audio
+is refused a request with audio, with a 400 that says so.
+
 Qwen Cloud (qwencloud.com), Alibaba's international Qwen platform, has keys
 of its own, made at home.qwencloud.com. Its pay as you go is `qwencloud`,
 at `{region}.maas.qwencloudapi.com` in six regions (`ap-southeast-1`, the
@@ -2339,6 +2345,13 @@ each of these groups ordered by the share used.
   is. Each member's own accounts go as its provider routes them, and the
   Routing page says an account went after those known only of one
   weighed against a known account of the same member.
+- **Before expiry, one by one** (`pace-drain`): picks the account as Use
+  before expiry does, the highest pace first, and then stays on it, as
+  Until used up does, until it is used up (100%), refused for its quota or
+  credit, or fails; then it picks again by pace. A pick isn't left for
+  another whose pace has risen since, nor taken back by one that renews;
+  so each account's allowance is used up in turn, the one that would lose
+  the most at its reset first.
 - **In turn**: each turn of a conversation goes to the next account. A new
   conversation goes to the account the fewest other conversations of the
   last 30 minutes are on.

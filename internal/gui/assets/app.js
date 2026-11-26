@@ -11618,21 +11618,6 @@ function renderModels(p) {
     const on = set ? [set] : (m.auto || []);
     return on.length > 0 && !on.some((a) => p.speaks.includes(a));
   };
-  const pickAPI = (c, id) => {
-    const m = p.models.find((x) => x.id === id) || { id };
-    const auto = (m.auto || []).map(apiLabel).join(" · ");
-    const opts = [{ v: "", name: "Auto", note: auto ? t("As its vendor's list says: {apis}", { apis: auto }) : "Each API the provider has, as it answers" },
-      ...apis.map(([k, l, hint]) => ({ v: k, name: l, note: hint }))];
-    openProtoMenu(c, opts, apiNow(id), (v) => {
-      if (v === apiNow(id)) return;
-      const prefs = draft.modelPrefs = draft.modelPrefs || {};
-      prefs[id] = prefs[id] || {};
-      if (v === (m.api || "")) delete prefs[id].api; else prefs[id].api = v;
-      if (!Object.keys(prefs[id]).length) delete prefs[id];
-      draw();
-      status(v ? t("{model} is asked on {api} once saved", { model: id, api: apiLabel(v) }) : t("{model} is asked as its vendor's list says once saved", { model: id }), "ok");
-    }, "API this model is asked on", "model-api-menu");
-  };
   // staged as Model settings' tick stages it (archsiono on X)
   const setImages = (id, m, v) => {
     const P = draft.modelPrefs = draft.modelPrefs || {}, x = P[id] = P[id] || {};
@@ -11672,7 +11657,7 @@ function renderModels(p) {
       acts.push({ name: "Copy model ID", icon: COPY_ICON, tip: id, run: () => copy(id, id, null, t("Model ID {model} copied", { model: id })) });
       if (apis.length && (!decidesModel(p, id) || apiNow(id) === "decide")) {
         const now = apiNow(id);
-        acts.push({ name: now ? t("Asked on {api}…", { api: apiLabel(now) }) : t("Asked on: Auto…"), icon: "M2.5 5h11M2.5 11h11M10.5 2.5 13.5 5l-3 2.5M5.5 8.5 2.5 11l3 2.5", tip: t("Pick the API this model is asked on"), run: () => pickAPI(c, id) });
+        acts.push({ name: now ? t("Asked on {api}…", { api: apiLabel(now) }) : t("Asked on: Auto…"), icon: "M2.5 5h11M2.5 11h11M10.5 2.5 13.5 5l-3 2.5M5.5 8.5 2.5 11l3 2.5", tip: t("Pick the API this model is asked on"), run: () => import("./modelorder.js").then(() => modelAPIPick(c, p, id, apis, apiNow, draw), statusErr) });
       }
       if (!decidesModel(p, id)) {
         const m = p.models.find((x) => x.id === id) || {}, x = draft.modelPrefs?.[id];
@@ -11738,8 +11723,11 @@ function renderModels(p) {
     draft.dashed = [...served];
     // models that would read alike say what tells them apart (modelTells)
     const tells = modelTells(p.models);
+    // by maker, the newest first (modelorder.js; WJaunita45604 on X)
+    const mo = window.modelOrder ? modelOrder(p.models, chips) : void import("./modelorder.js").then(() => chips.isConnected && draw(), () => {});
+    const put = mo ? mo.put : (c) => chips.append(c);
     // a filter is a search: what it doesn't match is left out
-    for (const m of p.models) {
+    for (const m of mo ? mo.list : p.models) {
       const on = draft.chosen.includes(m.id);
       if (f && !m.id.toLowerCase().includes(f) && !(m.name || "").toLowerCase().includes(f) && !(m.default || "").toLowerCase().includes(f)) continue;
       // past the first 80 only the picked are drawn, till the rest are asked for (#685)
@@ -11794,7 +11782,7 @@ function renderModels(p) {
         unpickedShown = p.id;
         draw();
       };
-      chips.append(c);
+      put(c, m);
       shown++;
     }
     for (const id of draft.chosen) {
@@ -11805,7 +11793,7 @@ function renderModels(p) {
       tested(c, id);
       menu(c, id);
       c.onclick = () => { draft.chosen = draft.chosen.filter((x) => x !== id); draft.none = true; draw(); };
-      chips.append(c);
+      put(c, { id });
     }
     if (hidden || unpicked) chips.append(showRest(hidden || unpicked, () => { if (unpicked) unpickedShown = p.id; else showAll = true; draw(); }));
     if (!p.models.length && !draft.chosen[0]) chips.append(el("span", "hint", t(emptyModelsHint(p))));
@@ -12544,6 +12532,9 @@ const ROUTINGS = [
   ["drain", "Until used up", "Requests stay on one until it is used up, then go to the next in the list and stay there: one before it that renews meanwhile doesn't take them back. One rate limited or failing is passed over while it rests, and requests come back to it after."],
   // the unit that goes round is the user's message (affine's "new-turn"),
   // not a session (Wing8Aqua on X)
+  // picked as Use before expiry picks, kept as Until used up keeps
+  // (guhailin3 on X; routes.PaceDrain)
+  ["pace-drain", "Before expiry, one by one", "Requests go to the subscription with the most left per hour until it is lost, as Use before expiry picks, and stay on it until it is used up or fails; then the next is picked the same way."],
   ["rotate", "In turn", "Each message you send goes to the next one, round the list; the agent's tool calls for it stay on the same one. A move costs some prompt cache; with Stays on Session, a whole conversation stays on one instead."],
   ["usage", "Least used first", "Each request goes to the one used least: a subscription by the share of its allowance used, a key by the tokens it served in the last hours."],
   ["pace", "Use before expiry", "Each request goes to the subscription with the most left per hour until it is lost, at its reset or as credits expire; one at 90% of its five hours waits until the others can't answer, a week at 90% is still spent before its reset. A key goes by the tokens it served in the last hours."],
@@ -12557,12 +12548,15 @@ const drawRotFig = (b, on, a) => (b.hidden = !on) ? b.replaceChildren() : (drawR
 // the routings besides Smart are the built-in plugin rotation's
 // (plugins/rotation): off, their options leave the page (data-feature),
 // and Smart is left — one in use keeps it on
-const ROTATION = new Set(["order", "drain", "rotate", "usage", "pace", "weight", "free", "fast", "cheap", "expiring", "fit"]);
+const ROTATION = new Set(["order", "drain", "pace-drain", "rotate", "usage", "pace", "weight", "free", "fast", "cheap", "expiring", "fit"]);
 // jsRoutings: the routings JS gateway plugins serve now ("<plugin>/<name>",
-// settings' jsRoutings, plugins/middleware's), and saved, a routing none
-// serves now, shown as it is: its pool is tried in its listed order
+// plugins/middleware's: the state's jsRoutings, which the Routing and
+// Plugins pages' own reads bring up to date too), and saved, a routing
+// none serves now, shown as it is: its pool is tried in its listed order.
+// Settings' copy alone left a pool's picker without them once the page
+// was read again after a change (guhailin3 on X).
 function jsRoutings(saved) {
-  const out = (state.settings?.jsRoutings || []).map((r) => [r.id, r.id,
+  const out = (state.jsRoutings || []).map((r) => [r.id, r.id,
     t("Routed by {name}, a routing of the gateway plugin {plugin}: it orders the accounts or keys for each request. If it fails or takes too long, they are tried in their listed order.", { name: r.name, plugin: r.plugin }), true]);
   if (saved && !ROUTINGS.some(([id]) => id === saved) && !out.some(([id]) => id === saved))
     out.push([saved, saved, t("No plugin serves this routing now, so requests go to the accounts or keys in their listed order. Turn on the gateway plugin that serves it on the Plugins page.")]);
@@ -12630,7 +12624,7 @@ function renderRouting(p) {
       ? t("Routing picks the account for each request through magpie, in the accounts' order; {agent} on its own stays signed in to {user}, whatever it has left.", { agent: a.agentName, user: keptLogin(p) })
       : p.keepLogin && !p.switchOnly
       ? t("Routing picks the account for each request through magpie; {agent} on its own stays signed in to the first account, whatever it has left.", { agent: a.agentName })
-      : routing === "drain"
+      : routing === "drain" || routing === "pace-drain"
         // Until used up keeps the requests on the next, and the sign-in
         // with them (provider.returnsToFirst; WalterAIBuilder on X)
         ? t("Routing picks the account for each request through magpie; {agent} on its own uses the one it is signed in to, which magpie moves to the next ticked account with room once it is used up, and keeps it there till that one is used up too.", { agent: a.agentName })
@@ -13739,7 +13733,7 @@ function firstLogin(a, p) {
 }
 
 function byQuotaOf(p, r = p?.routing || "") {
-  return p?.account && ["", "usage", "pace"].includes(r) ? ROUTINGS.find(([id]) => id === r)?.[1] : "";
+  return p?.account && ["", "usage", "pace", "pace-drain"].includes(r) ? ROUTINGS.find(([id]) => id === r)?.[1] : "";
 }
 function firstNoteOf(p, user) {
   return t("{user} is first in the order; {routing} still goes by each account's quota, so the order only settles ties. In order uses the first first.", { user, routing: t(byQuotaOf(p)) });
@@ -20330,6 +20324,18 @@ function renderSettings() {
   $("#lightweightRow").hidden = web;
   $("#lightweightSegs").replaceChildren(segs([["off", t("Off")], ["on", t("On")]], s.lightweight === true ? "on" : "off",
     (v) => savePrefs({ ...keep, lightweight: v === "on" })));
+  // Linux's app alone: whether WebKitGTK draws on the GPU, read at the
+  // next start (webkit_linux.go; ZDegress on X). Unchosen it follows
+  // magpie's pick, and a choice equal to it is saved as none, so a
+  // later pick (a driver changed) still applies. WEBKIT_* variables the
+  // user set are theirs, and the row says so instead.
+  const gpu = !web && s.gpu;
+  $("#generalMore").hidden = !gpu;
+  if (gpu) {
+    $("#gpuSub").textContent = gpu.env?.length ? t("Set by {vars} in the environment; magpie leaves it as it is", { vars: gpu.env.join(", ") }) : t("Takes effect when magpie next starts");
+    $("#gpuSegs").replaceChildren(gpu.env?.length ? "" : segs([["off", t("Off")], ["on", t("On")]], (s.gpuRendering ?? gpu.auto) ? "on" : "off",
+      (v) => savePrefs({ ...keep, gpuRendering: (v === "on") === gpu.auto ? null : v === "on" })));
+  }
   // the display kept on too (#975)
   $("#keepAwakeSegs").replaceChildren(segs([["off", t("Off")], ["on", t("On")], ["display", t("Screen on too")]],
     !s.keepAwake ? "off" : s.keepAwakeDisplay ? "display" : "on",
@@ -22258,6 +22264,10 @@ function renderRedact(s, keep) {
   rowIn(find, t("Rules"), masking ? t("Keys, tokens, emails and numbers whose checksum adds up: patterns that are certain, checked on every request") : why, always).id = "maskRulesRow";
   if (window.hideAccounts) rowIn(share, t("Hide accounts"), t("Email addresses and account names on every page are blurred, for a screenshot to share"),
     onOff(window.hideAccounts.on(), (on) => { window.hideAccounts.set(on); renderSettings(); }));
+  // what the last requests said, on Routing and Gateway (llxth1 on X);
+  // off, the gateway keeps none of it (gateway/request_text.go)
+  rowIn(share, t("Show request content"), t("What the last requests said, on the Routing and Gateway pages, kept in memory only. Off, magpie keeps none of it"),
+    onOff(!s.hideRequestText, (on) => savePrefs({ ...keep, hideRequestText: !on }))).id = "hideRequestTextRow";
   rowIn(share, t("Turn off telemetry for all agents"), t("Over each agent's own Telemetry switch, an agent found later too"),
     onOff(s.agentTelemetryOff, (off) => writingPrefs(api("settings/agent-telemetry", { off })).then((ns) => {
       prefs = state.settings = ns;
