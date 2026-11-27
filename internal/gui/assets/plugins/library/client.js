@@ -14,6 +14,8 @@ magpie.plugin("library", (ctx) => {
 
   let lib = null;        // the page, as /api/library gives it
   let taken = 0;         // how many times lib was set, for a read to tell a newer answer came first
+  let wholeAt = 0;       // the last time it was set whole, not a part of it
+  const partAt = {};     // when each key was last set by a part of the page
   let tab = "instructions";
   let shown = "";        // the tab the page last drew, which fades in only when it changes
   let fits = [];         // textareas to fit before the page is painted
@@ -607,7 +609,22 @@ magpie.plugin("library", (ctx) => {
   // written kept as they were last clicked. A server or skill added,
   // removed or renamed changes what the market calls added (#300): one gone
   // from the library loses its mark at once, and the market is asked again.
+  // What a change to the MCP servers alone answers with (library.ReadMCP):
+  // reading the whole page again went through every agent's skill folders,
+  // seconds of each Save on Windows (zysicyj on X).
+  const MCP_PART = ["agents", "servers", "foundServers", "projects", "plugins", "mcpHub"];
   function take(v) {
+    // a part of the page, the rest kept as it is: the instructions' (#1624)
+    // or the MCP servers'
+    if (v.part) {
+      const keys = v.part === "mcp" ? MCP_PART : ["instructions"], from = v.part === "mcp" ? v.mcp : v;
+      const p = { ...lib, problems: v.problems, result: v.result };
+      for (const k of [...keys, "problems"]) {
+        if (k !== "problems") p[k] = from[k];
+        partAt[k] = taken + 1;
+      }
+      v = p;
+    } else if (v !== lib) wholeAt = taken + 1; // lib taken again is no newer than it was
     // What the reader hid stays hidden while it still fails and nothing
     // else does: every change writes every agent again, so a file magpie
     // can't stat fails at each one (#3745). A failure not hidden brings the
@@ -682,8 +699,12 @@ magpie.plugin("library", (ctx) => {
     try {
       const at = taken;
       const v = await api("library");
-      // a change answered meanwhile, with the library as it is after it
-      if (taken !== at) return;
+      // a change answered meanwhile, with the library as it is after it;
+      // one answered with a part of it, newer than this read in that part
+      if (taken !== at) {
+        if (wholeAt > at) return;
+        for (const k of Object.keys(partAt)) if (partAt[k] > at) v[k] = lib[k];
+      }
       const was = lib && seen(lib);
       take(v);
       if (glanced && tab !== "skills") return;
@@ -723,7 +744,7 @@ magpie.plugin("library", (ctx) => {
     let ok = false;
     try {
       const v = await api("library/" + path, body);
-      take(v.part === "instructions" ? { ...lib, instructions: v.instructions, problems: v.problems, result: v.result } : v);
+      take(v);
       status(""); // what it did, said next, or nothing for one that says nothing
       report(v.result, done, null, settled);
       ok = true;
@@ -4108,6 +4129,9 @@ magpie.plugin("library", (ctx) => {
       case "refused": return [t("connection refused"), more(t("Nothing is listening at that address"))];
       case "unreachable": return [t("can't reach"), more(t("Can't reach the server"))];
       case "protocol": return [t("bad reply"), more(t("It answered, but not as an MCP server does"))];
+      // a renewal the server rate-limited (429): still signed in, and
+      // renewed once the server's wait is over (#7451)
+      case "ratelimited": return [t("renewal rate-limited"), more(t("The server is limiting how often magpie renews its sign-in. It stays signed in, and magpie renews it once the wait is over"))];
       // a ${NAME} magpie's own environment hasn't; an agent started from a
       // shell that has it still gets it
       case "novar": return [t("{names} not set", { names: h.detail }), t("magpie can't check it: {names} isn't set where magpie runs. An agent started where it is set still gets it", { names: h.detail })];
@@ -4165,7 +4189,7 @@ magpie.plugin("library", (ctx) => {
       // agent's own launch sets says nothing of the server, so it isn't
       // painted as broken (#2308, ASD-max: Codex's host-only codex_app,
       // whose pipe Codex itself hands it)
-      b.className = "lib-health " + (e.h.state === "ok" || e.h.agentSignIn?.length ? "ok" : e.h.state === "auth" ? "auth" : e.h.why === "novar" || e.h.why === "wsldown" ? "unknown" : "err");
+      b.className = "lib-health " + (e.h.state === "ok" || e.h.agentSignIn?.length ? "ok" : e.h.state === "auth" || e.h.why === "ratelimited" ? "auth" : e.h.why === "novar" || e.h.why === "wsldown" ? "unknown" : "err");
       b.replaceChildren(el("span", "", text));
       if (toolList(b.dataset.server).length) {
         const open = toolsOpen.has(b.dataset.server);

@@ -888,12 +888,13 @@ of them, by the route the request is sent to before anything is read or
 sent upstream (`keySurfaceGuard`): chat completions, responses (its
 WebSocket too), messages and count_tokens, embeddings, rerank, images,
 audio, video, realtime, `/v1/decisions` and `/v1/systemone`, Gemini's,
-Ollama's and Codex's routes, a vendor's own API, the chat page, every
+Ollama's and Codex's routes, a vendor's own API, the chat page, an
+artifact page's model, speech, dictation and send-to-agent calls, every
 model list, the quotas, the accounts and routing behind them. The answer
 is a 403 with `gateway_key_mcp_only`. A key for models only is refused
 every MCP route the same way, with `gateway_key_no_mcp`: the hub,
-`/mcp/<name>`, `/mcp/run/<name>`, magpie's own servers and
-`/v1/magpie/mcp` (before, it reached them and was given no tool). A key
+`/mcp/<name>`, `/mcp/run/<name>`, magpie's own servers,
+`/v1/magpie/mcp` and an artifact page's MCP calls (before, it reached them and was given no tool). A key
 issued under either is held to the same. From another computer, a key for
 MCP servers only is given the Library's servers that run as programs on
 this computer, as a key with every model is: its MCP list, not a model
@@ -1568,8 +1569,10 @@ on the command line, where the plugin's name or the id alone will do when it
 names one API; an empty `magpie search` lists the plugins' APIs). An API
 that signs in to the plugin's own provider (agy-cli's) is added by itself
 when you sign in to that provider and no search API was ever set up; one you
-remove stays removed. magpie keeps its keys (several, tried in turn, a refused
-one resting), its order and its place in the request log, masks the query
+remove stays removed. A list that has the withdrawn Antigravity plugin's
+search gets agy-cli's in front of it, once, while you are signed in to
+agy-cli. magpie keeps its keys (several, tried in turn, a refused one
+resting), its order and its place in the request log, masks the query
 as it does for every search API, and asks the plugin only while the
 plugin is on and the Web search plugin is.
 
